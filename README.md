@@ -11,6 +11,7 @@ This repository contains a protocol/specification plus multiple implementations 
 ├── LICENSE.md
 ├── README.md
 ├── go/
+├── java/
 ├── python/
 ├── ruby/
 ├── rust/
@@ -62,6 +63,25 @@ cd go && go build -o fsrouter .
 
 - Docs:
   - `go/README.md`
+
+### Java
+
+Located in `java/`.
+
+- Build:
+
+```bash
+cd java && javac FSRouter.java
+```
+
+- Run:
+
+```bash
+cd java && java FSRouter
+```
+
+- Docs:
+  - `java/README.md`
 
 ### Rust
 

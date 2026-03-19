@@ -11,6 +11,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GO_DIR = REPO_ROOT / "go"
+JAVA_DIR = REPO_ROOT / "java"
 RUST_DIR = REPO_ROOT / "rust"
 PYTHON_DIR = REPO_ROOT / "python"
 RUBY_DIR = REPO_ROOT / "ruby"
@@ -116,6 +117,16 @@ class FsrouterComplianceTests(unittest.TestCase):
             )
             cls.command = [str(cls.binary)]
             cls.command_cwd = cls.binary.parent
+        elif implementation == "java":
+            cls.binary = JAVA_DIR / "FSRouter.class"
+            result = subprocess.run(
+                ["javac", "FSRouter.java"],
+                cwd=str(JAVA_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["java", "FSRouter"]
+            cls.command_cwd = JAVA_DIR
         elif implementation == "rust":
             cls.binary = RUST_DIR / "target" / "release" / binary_name
             result = subprocess.run(
