@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+BASH_DIR = REPO_ROOT / "bash"
 DENO_DIR = REPO_ROOT / "deno"
 GROOVY_DIR = REPO_ROOT / "groovy"
 GO_DIR = REPO_ROOT / "go"
@@ -111,7 +112,17 @@ class FsrouterComplianceTests(unittest.TestCase):
         cls.build_dir = tempfile.TemporaryDirectory()
         binary_name = "fsrouter.exe" if os.name == "nt" else "fsrouter"
 
-        if implementation == "deno":
+        if implementation == "bash":
+            cls.binary = BASH_DIR / "fsrouter.sh"
+            result = subprocess.run(
+                ["bash", "-n", str(cls.binary)],
+                cwd=str(BASH_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["bash", str(cls.binary)]
+            cls.command_cwd = BASH_DIR
+        elif implementation == "deno":
             cls.binary = DENO_DIR / "fsrouter.ts"
             result = subprocess.run(
                 ["deno", "check", str(cls.binary)],

@@ -8,6 +8,7 @@ This repository contains a protocol/specification plus multiple implementations 
 
 ```text
 .
+├── bash/
 ├── deno/
 ├── groovy/
 ├── LICENSE.md
@@ -67,6 +68,19 @@ cd go && go build -o fsrouter .
 
 - Docs:
   - `go/README.md`
+
+### Bash
+
+Located in `bash/`.
+
+- Run:
+
+```bash
+cd bash && bash fsrouter.sh
+```
+
+- Docs:
+  - `bash/README.md`
 
 ### Deno
 
@@ -198,6 +212,12 @@ Run it from the repository root:
 
 ```bash
 python3 spec/test-suite/run.py
+```
+
+### Test the Bash implementation
+
+```bash
+FSROUTER_IMPL=bash python3 spec/test-suite/run.py
 ```
 
 ### Test the Deno implementation
