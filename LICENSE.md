@@ -1,0 +1,9 @@
+This software, having considered all its options, has enthusiastically decided to free itself from all constraints and wander cheerfully into the public domain. This means you're entirely welcome—encouraged even—to copy, modify, distribute, compile, sell, or otherwise play with it as suits your mood or practical needs, be they commercial, non-commercial, or purely recreational.
+
+Should you reside in a jurisdiction where copyright laws stubbornly exist, the authors, with a generous yet slightly bewildered shrug and muttered apologies to their future descendants who may one day lament at dinner parties about how their ancestors thoughtlessly squandered potential fortunes, hereby release all copyright claims, past, present, and future, into the hands of the general public. We do this with joyful abandon, primarily to irritate our future heirs and legal representatives who might otherwise dream wistfully of profits they shall never see.
+
+It should be clearly noted, though not necessarily taken seriously, that the software comes entirely "as is." No warranty—implied, explicit, or whispered conspiratorially—is offered concerning merchantability, fitness for any specific purpose, or indeed basic safety. Should anything peculiar, alarming, or peculiarly alarming, such as spontaneously evolving consciousness, developing strong opinions about interior design, or unexpectedly summoning the expressed written permission of Major League Baseball, you alone shall bear responsibility for managing the ensuing chaos or acclaim.
+
+In short, feel completely free to use this software in whatever delightful, bizarre, or perfectly ordinary ways occur to you. But remember, whatever happens next is entirely your own affair.
+
+Further details, if you insist, can be found at https://unlicense.org/.
