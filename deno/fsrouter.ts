@@ -1,0 +1,539 @@
+const HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
+
+type MatchResult = {
+  node: Node | null;
+  params: Record<string, string> | null;
+};
+
+type ParsedCgi = {
+  status: number;
+  contentType: string;
+  headers: Array<[string, string]>;
+  body: Uint8Array;
+};
+
+class Node {
+  literal = new Map<string, Node>();
+  param: Node | null = null;
+  paramName = "";
+  handlers = new Map<string, string>();
+
+  match(segs: string[]): MatchResult {
+    const params: Record<string, string> = {};
+    let cur: Node = this;
+    for (const seg of segs) {
+      const literal = cur.literal.get(seg);
+      if (literal) {
+        cur = literal;
+        continue;
+      }
+      if (cur.param) {
+        params[cur.param.paramName] = seg;
+        cur = cur.param;
+        continue;
+      }
+      return { node: null, params: null };
+    }
+    return { node: cur, params };
+  }
+}
+
+type RouteItem = {
+  route: string;
+  method: string;
+  path: string;
+  tag: string;
+};
+
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+function envOr(key: string, fallback: string): string {
+  const value = Deno.env.get(key);
+  return value && value.length > 0 ? value : fallback;
+}
+
+function parseTimeout(value: string): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+}
+
+function normalizeRequestPath(path: string): string[] {
+  let collapsed = path.replace(/\/+/g, "/");
+  if (!collapsed) {
+    collapsed = "/";
+  }
+  const trimmed = collapsed === "/" ? collapsed : collapsed.replace(/\/$/, "");
+  const segs: string[] = [];
+  for (const segment of trimmed.split("/")) {
+    if (!segment) {
+      continue;
+    }
+    const decoded = decodeURIComponent(segment);
+    if (decoded === "..") {
+      throw new Error("invalid path");
+    }
+    segs.push(decoded);
+  }
+  return segs;
+}
+
+function joinFsPath(base: string, part: string): string {
+  if (base.endsWith("/")) {
+    return `${base}${part}`;
+  }
+  return `${base}/${part}`;
+}
+
+function joinRoute(prefix: string, seg: string): string {
+  return prefix ? `${prefix}/${seg}` : seg;
+}
+
+async function buildTree(routeDir: string): Promise<Node> {
+  const absDir = await Deno.realPath(routeDir);
+  const root = new Node();
+  await walkRouteDir(absDir, absDir, root);
+  return root;
+}
+
+async function walkRouteDir(baseDir: string, currentDir: string, root: Node): Promise<void> {
+  for await (const entry of Deno.readDir(currentDir)) {
+    const fullPath = joinFsPath(currentDir, entry.name);
+    if (entry.isDirectory) {
+      await walkRouteDir(baseDir, fullPath, root);
+      continue;
+    }
+    if (!entry.isFile) {
+      continue;
+    }
+    const method = entry.name.toUpperCase();
+    if (!HTTP_METHODS.has(method)) {
+      continue;
+    }
+    const parent = currentDir;
+    const relativeParent = parent === baseDir ? "" : parent.slice(baseDir.length + 1);
+    let cur = root;
+    if (relativeParent) {
+      for (const seg of relativeParent.split("/")) {
+        if (seg.startsWith(":")) {
+          if (!cur.param) {
+            cur.param = new Node();
+            cur.param.paramName = seg.slice(1);
+          }
+          cur = cur.param;
+        } else {
+          let next = cur.literal.get(seg);
+          if (!next) {
+            next = new Node();
+            cur.literal.set(seg, next);
+          }
+          cur = next;
+        }
+      }
+    }
+    cur.handlers.set(method, fullPath);
+  }
+}
+
+async function isExecutable(path: string): Promise<boolean> {
+  const info = await Deno.stat(path);
+  if (info.mode != null) {
+    return (info.mode & 0o111) !== 0;
+  }
+  return true;
+}
+
+async function collectRoutes(node: Node, prefix: string, items: RouteItem[]): Promise<void> {
+  const route = prefix ? `/${prefix}` : "/";
+  for (const [method, path] of [...node.handlers.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    let tag = "unknown";
+    try {
+      tag = (await isExecutable(path)) ? "exec" : "static";
+    } catch {
+      tag = "unknown";
+    }
+    items.push({ route, method, path, tag });
+  }
+  for (const seg of [...node.literal.keys()].sort()) {
+    await collectRoutes(node.literal.get(seg)!, joinRoute(prefix, seg), items);
+  }
+  if (node.param) {
+    await collectRoutes(node.param, joinRoute(prefix, `:${node.param.paramName}`), items);
+  }
+}
+
+async function printRoutes(root: Node, routeDir: string): Promise<void> {
+  console.error(`routes from ${routeDir}:`);
+  const items: RouteItem[] = [];
+  await collectRoutes(root, "", items);
+  items.sort((a, b) => a.route.localeCompare(b.route) || a.method.localeCompare(b.method));
+  for (const item of items) {
+    console.error(`  ${item.method.padEnd(7)} ${item.route.padEnd(45)} → ${item.path} [${item.tag}]`);
+  }
+}
+
+function splitHostPort(value: string): { host: string; port: string } {
+  if (!value) {
+    return { host: "", port: "" };
+  }
+  if (value.startsWith("[") && value.includes("]")) {
+    const end = value.indexOf("]");
+    const host = value.slice(1, end);
+    const rest = value.slice(end + 1);
+    if (rest.startsWith(":")) {
+      return { host, port: rest.slice(1) };
+    }
+    return { host, port: "" };
+  }
+  const colonCount = [...value].filter((ch) => ch === ":").length;
+  if (colonCount === 1) {
+    const idx = value.lastIndexOf(":");
+    return { host: value.slice(0, idx), port: value.slice(idx + 1) };
+  }
+  return { host: value, port: "" };
+}
+
+function envKey(value: string): string {
+  return value.toUpperCase().replace(/-/g, "_");
+}
+
+function buildEnv(request: Request, params: Record<string, string>, remoteAddr: Deno.NetAddr | null, listenAddr: string): Record<string, string> {
+  const env: Record<string, string> = { ...Deno.env.toObject() };
+  const url = new URL(request.url);
+  env.REQUEST_METHOD = request.method;
+  env.REQUEST_URI = url.pathname + url.search;
+  env.REQUEST_PATH = url.pathname;
+  env.QUERY_STRING = url.search.startsWith("?") ? url.search.slice(1) : "";
+  env.CONTENT_TYPE = request.headers.get("content-type") ?? "";
+  env.CONTENT_LENGTH = request.headers.get("content-length") ?? "";
+  env.REMOTE_ADDR = remoteAddr ? `${remoteAddr.hostname}:${remoteAddr.port}` : "";
+
+  const hostHeader = request.headers.get("host") ?? listenAddr;
+  const hostPort = splitHostPort(hostHeader);
+  env.SERVER_NAME = hostPort.host;
+  if (hostPort.port) {
+    env.SERVER_PORT = hostPort.port;
+  }
+
+  for (const [key, value] of Object.entries(params)) {
+    env[`PARAM_${envKey(key)}`] = value;
+  }
+
+  const seenQuery = new Set<string>();
+  for (const [key, value] of url.searchParams.entries()) {
+    if (seenQuery.has(key)) {
+      continue;
+    }
+    seenQuery.add(key);
+    env[`QUERY_${envKey(key)}`] = value;
+  }
+
+  const seenHeaders = new Set<string>();
+  for (const [key, value] of request.headers.entries()) {
+    const lower = key.toLowerCase();
+    if (seenHeaders.has(lower)) {
+      continue;
+    }
+    seenHeaders.add(lower);
+    env[`HTTP_${key.toUpperCase().replace(/-/g, "_")}`] = value;
+  }
+
+  return env;
+}
+
+function exitToStatus(code: number): number {
+  if (code === 0) {
+    return 200;
+  }
+  if (code === 1) {
+    return 400;
+  }
+  return 500;
+}
+
+function responseBody(body: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(body.byteLength);
+  copy.set(body);
+  return copy.buffer;
+}
+
+function jsonResponse(status: number, payload: unknown, method: string, headers: HeadersInit = {}): Response {
+  const bodyText = JSON.stringify(payload);
+  const initHeaders = new Headers(headers);
+  initHeaders.set("content-type", "application/json");
+  initHeaders.set("content-length", String(textEncoder.encode(bodyText).length));
+  return new Response(method === "HEAD" ? null : bodyText, { status, headers: initHeaders });
+}
+
+function looksLikeHeader(raw: Uint8Array): boolean {
+  for (const byte of raw) {
+    if (byte === 58) {
+      return true;
+    }
+    if (byte === 10 || byte === 13 || byte === 32 || byte === 9) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function parseCgiHeaders(raw: Uint8Array, defaultStatus: number): ParsedCgi | null {
+  let status = defaultStatus;
+  let contentType = "application/json";
+  const headers: Array<[string, string]> = [];
+  let pos = 0;
+  let sawBlank = false;
+
+  while (pos < raw.length) {
+    let newline = pos;
+    while (newline < raw.length && raw[newline] !== 10) {
+      newline += 1;
+    }
+    let line = raw.slice(pos, newline);
+    const nextPos = newline < raw.length ? newline + 1 : raw.length;
+    if (line.length > 0 && line[line.length - 1] === 13) {
+      line = line.slice(0, line.length - 1);
+    }
+    if (line.length === 0) {
+      sawBlank = true;
+      pos = nextPos;
+      break;
+    }
+    const text = textDecoder.decode(line);
+    const idx = text.indexOf(":");
+    if (idx <= 0) {
+      return null;
+    }
+    const key = text.slice(0, idx);
+    for (const ch of key) {
+      const code = ch.charCodeAt(0);
+      if (code <= 32 || code === 127) {
+        return null;
+      }
+    }
+    const value = text.slice(idx + 1).trim();
+    if (key.toLowerCase() === "status") {
+      const code = Number.parseInt(value.split(/\s+/)[0] ?? "", 10);
+      if (Number.isFinite(code)) {
+        status = code;
+      }
+    } else if (key.toLowerCase() === "content-type") {
+      contentType = value;
+    } else {
+      headers.push([key, value]);
+    }
+    pos = nextPos;
+  }
+
+  if (!sawBlank) {
+    return null;
+  }
+
+  return {
+    status,
+    contentType,
+    headers,
+    body: raw.slice(pos),
+  };
+}
+
+async function executeHandler(handlerPath: string, request: Request, params: Record<string, string>, timeoutSeconds: number, remoteAddr: Deno.NetAddr | null, listenAddr: string): Promise<Response> {
+  const requestBody = new Uint8Array(await request.arrayBuffer());
+  const env = buildEnv(request, params, remoteAddr, listenAddr);
+  const cwd = handlerPath.includes("/") ? handlerPath.slice(0, handlerPath.lastIndexOf("/")) : ".";
+
+  let child: Deno.ChildProcess;
+  try {
+    child = new Deno.Command(handlerPath, {
+      cwd,
+      env,
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+  } catch (error) {
+    return jsonResponse(502, { error: "exec_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
+  }
+
+  const stdinPromise = (async () => {
+    if (child.stdin) {
+      const writer = child.stdin.getWriter();
+      await writer.write(requestBody);
+      await writer.close();
+    }
+  })();
+
+  const stdoutPromise = child.stdout ? new Response(child.stdout).arrayBuffer().then((buf) => new Uint8Array(buf)) : Promise.resolve(new Uint8Array());
+  const stderrPromise = child.stderr ? new Response(child.stderr).arrayBuffer().then((buf) => new Uint8Array(buf)) : Promise.resolve(new Uint8Array());
+
+  let timedOut = false;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    const id = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+      clearTimeout(id);
+      reject(new Error("timeout"));
+    }, timeoutSeconds * 1000);
+  });
+
+  let status: Deno.CommandStatus;
+  let stdout: Uint8Array;
+  let stderr: Uint8Array;
+  try {
+    await stdinPromise;
+    status = await Promise.race([child.status, timeoutPromise]);
+    [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+  } catch (error) {
+    if (timedOut) {
+      return jsonResponse(504, { error: "handler_timeout", timeout_seconds: timeoutSeconds }, request.method);
+    }
+    return jsonResponse(500, { error: "exec_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
+  }
+
+  if (stderr.length > 0) {
+    console.error(`  [handler stderr] ${textDecoder.decode(stderr).replace(/\n$/, "")}`);
+  }
+
+  let raw = stdout;
+  if (raw.length === 0 && status.code !== 0 && stderr.length > 0) {
+    raw = stderr;
+  }
+
+  let responseStatus = exitToStatus(status.code);
+  let contentType = "application/json";
+  const headers = new Headers();
+  let body = raw;
+
+  if (raw.length > 0 && looksLikeHeader(raw)) {
+    const parsed = parseCgiHeaders(raw, responseStatus);
+    if (parsed) {
+      responseStatus = parsed.status;
+      contentType = parsed.contentType;
+      body = parsed.body;
+      for (const [key, value] of parsed.headers) {
+        headers.append(key, value);
+      }
+    }
+  }
+
+  headers.set("content-type", contentType);
+  headers.set("content-length", String(body.length));
+  return new Response(request.method === "HEAD" ? null : responseBody(body), { status: responseStatus, headers });
+}
+
+async function serveStatic(handlerPath: string, request: Request): Promise<Response> {
+  try {
+    const body = await Deno.readFile(handlerPath);
+    const headers = new Headers();
+    headers.set("content-type", "application/octet-stream");
+    headers.set("content-length", String(body.length));
+    return new Response(request.method === "HEAD" ? null : responseBody(body), { status: 200, headers });
+  } catch (error) {
+    return jsonResponse(500, { error: "static_read_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
+  }
+}
+
+function parseListenAddr(addr: string): { hostname: string; port: number } {
+  if (addr.startsWith(":")) {
+    return { hostname: "0.0.0.0", port: Number.parseInt(addr.slice(1), 10) };
+  }
+  if (addr.startsWith("[") && addr.includes("]")) {
+    const { host, port } = splitHostPort(addr);
+    return { hostname: host, port: Number.parseInt(port, 10) };
+  }
+  if ([...addr].filter((ch) => ch === ":").length === 1) {
+    const idx = addr.lastIndexOf(":");
+    return { hostname: addr.slice(0, idx), port: Number.parseInt(addr.slice(idx + 1), 10) };
+  }
+  return { hostname: addr, port: 8080 };
+}
+
+function logResult(request: Request, status: number, start: number): void {
+  const url = new URL(request.url);
+  const elapsed = (performance.now() - start) / 1000;
+  console.error(`${request.method} ${url.pathname} → ${status} (${elapsed.toFixed(6)}s)`);
+}
+
+async function handleRequest(request: Request, root: Node, timeoutSeconds: number, listenAddr: string, remoteAddr: Deno.NetAddr | null): Promise<Response> {
+  const start = performance.now();
+  const url = new URL(request.url);
+  let response: Response;
+
+  try {
+    const segs = normalizeRequestPath(url.pathname);
+    const match = root.match(segs);
+    if (!match.node || match.node.handlers.size === 0) {
+      response = jsonResponse(404, { error: "not_found", path: url.pathname }, request.method);
+      logResult(request, response.status, start);
+      return response;
+    }
+
+    let handlerPath = match.node.handlers.get(request.method) ?? null;
+    if (!handlerPath && request.method === "HEAD") {
+      handlerPath = match.node.handlers.get("GET") ?? null;
+    }
+    if (!handlerPath) {
+      const allowed = [...match.node.handlers.keys()].sort();
+      response = jsonResponse(405, { error: "method_not_allowed", allow: allowed }, request.method, {
+        allow: allowed.join(", "),
+      });
+      logResult(request, response.status, start);
+      return response;
+    }
+
+    try {
+      if (await isExecutable(handlerPath)) {
+        response = await executeHandler(handlerPath, request, match.params ?? {}, timeoutSeconds, remoteAddr, listenAddr);
+      } else {
+        response = await serveStatic(handlerPath, request);
+      }
+    } catch (error) {
+      response = jsonResponse(500, { error: "handler_stat_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
+    }
+  } catch {
+    response = jsonResponse(400, { error: "invalid_path", path: url.pathname }, request.method);
+  }
+
+  logResult(request, response.status, start);
+  return response;
+}
+
+async function main(): Promise<void> {
+  const routeDir = envOr("ROUTE_DIR", "./routes");
+  const listenAddr = envOr("LISTEN_ADDR", ":8080");
+  const timeoutSeconds = parseTimeout(envOr("COMMAND_TIMEOUT", "30"));
+
+  let root: Node;
+  try {
+    root = await buildTree(routeDir);
+  } catch (error) {
+    console.error(`failed to scan ${routeDir}: ${error instanceof Error ? error.message : String(error)}`);
+    Deno.exit(1);
+    throw error;
+  }
+
+  await printRoutes(root, routeDir);
+  const bind = parseListenAddr(listenAddr);
+  const controller = new AbortController();
+
+  const shutdown = () => {
+    console.error("shutting down...");
+    controller.abort();
+  };
+  Deno.addSignalListener("SIGINT", shutdown);
+  Deno.addSignalListener("SIGTERM", shutdown);
+
+  console.error(`listening on ${listenAddr} (timeout ${timeoutSeconds}s)`);
+  const server = Deno.serve({ hostname: bind.hostname, port: bind.port, signal: controller.signal }, (request: Request, info: Deno.ServeHandlerInfo<Deno.NetAddr>) => {
+    const remoteAddr = info.remoteAddr?.transport === "tcp" ? info.remoteAddr : null;
+    return handleRequest(request, root, timeoutSeconds, listenAddr, remoteAddr);
+  });
+  await server.finished;
+}
+
+if (import.meta.main) {
+  await main();
+}

@@ -8,6 +8,7 @@ This repository contains a protocol/specification plus multiple implementations 
 
 ```text
 .
+├── deno/
 ├── LICENSE.md
 ├── README.md
 ├── go/
@@ -63,6 +64,19 @@ cd go && go build -o fsrouter .
 
 - Docs:
   - `go/README.md`
+
+### Deno
+
+Located in `deno/`.
+
+- Run:
+
+```bash
+cd deno && deno run --allow-net --allow-read --allow-run --allow-env fsrouter.ts
+```
+
+- Docs:
+  - `deno/README.md`
 
 ### Java
 
@@ -138,6 +152,12 @@ Run it from the repository root:
 
 ```bash
 python3 spec/test-suite/run.py
+```
+
+### Test the Deno implementation
+
+```bash
+FSROUTER_IMPL=deno python3 spec/test-suite/run.py
 ```
 
 ### Test the Rust implementation

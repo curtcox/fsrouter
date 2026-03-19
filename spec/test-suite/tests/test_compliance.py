@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+DENO_DIR = REPO_ROOT / "deno"
 GO_DIR = REPO_ROOT / "go"
 JAVA_DIR = REPO_ROOT / "java"
 RUST_DIR = REPO_ROOT / "rust"
@@ -107,7 +108,17 @@ class FsrouterComplianceTests(unittest.TestCase):
         cls.build_dir = tempfile.TemporaryDirectory()
         binary_name = "fsrouter.exe" if os.name == "nt" else "fsrouter"
 
-        if implementation == "go":
+        if implementation == "deno":
+            cls.binary = DENO_DIR / "fsrouter.ts"
+            result = subprocess.run(
+                ["deno", "check", str(cls.binary)],
+                cwd=str(DENO_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["deno", "run", "--allow-net", "--allow-read", "--allow-run", "--allow-env", str(cls.binary)]
+            cls.command_cwd = DENO_DIR
+        elif implementation == "go":
             cls.binary = Path(cls.build_dir.name) / binary_name
             result = subprocess.run(
                 ["go", "build", "-o", str(cls.binary), "."],
