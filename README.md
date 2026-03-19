@@ -12,6 +12,7 @@ This repository contains a protocol/specification plus multiple implementations 
 ├── README.md
 ├── go/
 ├── python/
+├── ruby/
 ├── rust/
 └── spec/
 ```
@@ -88,6 +89,19 @@ cd python && python3 fsrouter.py
 - Docs:
   - `python/README.md`
 
+### Ruby
+
+Located in `ruby/`.
+
+- Run:
+
+```bash
+cd ruby && ruby fsrouter.rb
+```
+
+- Docs:
+  - `ruby/README.md`
+
 ## Protocol and compliance
 
 The authoritative behavior lives in:
@@ -116,6 +130,12 @@ FSROUTER_IMPL=rust python3 spec/test-suite/run.py
 
 ```bash
 FSROUTER_IMPL=python python3 spec/test-suite/run.py
+```
+
+### Test the Ruby implementation
+
+```bash
+FSROUTER_IMPL=ruby python3 spec/test-suite/run.py
 ```
 
 ## Configuration

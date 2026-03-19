@@ -5,3 +5,7 @@
 *.swo
 *.tmp
 *.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 GO_DIR = REPO_ROOT / "go"
 RUST_DIR = REPO_ROOT / "rust"
 PYTHON_DIR = REPO_ROOT / "python"
+RUBY_DIR = REPO_ROOT / "ruby"
 
 
 class RunningServer:
@@ -135,6 +136,16 @@ class FsrouterComplianceTests(unittest.TestCase):
             )
             cls.command = ["python3", str(cls.binary)]
             cls.command_cwd = PYTHON_DIR
+        elif implementation == "ruby":
+            cls.binary = RUBY_DIR / "fsrouter.rb"
+            result = subprocess.run(
+                ["ruby", "-c", str(cls.binary)],
+                cwd=str(RUBY_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["ruby", str(cls.binary)]
+            cls.command_cwd = RUBY_DIR
         else:
             raise RuntimeError(f"unsupported FSROUTER_IMPL: {implementation}")
 
