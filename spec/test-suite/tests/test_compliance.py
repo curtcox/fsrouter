@@ -14,6 +14,7 @@ DENO_DIR = REPO_ROOT / "deno"
 GROOVY_DIR = REPO_ROOT / "groovy"
 GO_DIR = REPO_ROOT / "go"
 JAVA_DIR = REPO_ROOT / "java"
+LUA_DIR = REPO_ROOT / "lua"
 RUST_DIR = REPO_ROOT / "rust"
 PYTHON_DIR = REPO_ROOT / "python"
 RUBY_DIR = REPO_ROOT / "ruby"
@@ -129,6 +130,20 @@ class FsrouterComplianceTests(unittest.TestCase):
             )
             cls.command = ["groovy", str(cls.binary)]
             cls.command_cwd = GROOVY_DIR
+        elif implementation == "lua":
+            cls.binary = LUA_DIR / "fsrouter.lua"
+            result = subprocess.run(
+                [
+                    "lua",
+                    "-e",
+                    "assert(loadfile('fsrouter.lua')); assert(require('socket')); assert(require('system'))",
+                ],
+                cwd=str(LUA_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["lua", str(cls.binary)]
+            cls.command_cwd = LUA_DIR
         elif implementation == "go":
             cls.binary = Path(cls.build_dir.name) / binary_name
             result = subprocess.run(

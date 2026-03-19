@@ -11,6 +11,7 @@ This repository contains a protocol/specification plus multiple implementations 
 ├── deno/
 ├── groovy/
 ├── LICENSE.md
+├── lua/
 ├── README.md
 ├── go/
 ├── java/
@@ -91,6 +92,23 @@ cd groovy && groovy fsrouter.groovy
 
 - Docs:
   - `groovy/README.md`
+
+### Lua
+
+Located in `lua/`.
+
+- Dependencies:
+  - `LuaSocket`
+  - `LuaSystem`
+
+- Run:
+
+```bash
+cd lua && lua fsrouter.lua
+```
+
+- Docs:
+  - `lua/README.md`
 
 ### Java
 
@@ -178,6 +196,12 @@ FSROUTER_IMPL=deno python3 spec/test-suite/run.py
 
 ```bash
 FSROUTER_IMPL=groovy python3 spec/test-suite/run.py
+```
+
+### Test the Lua implementation
+
+```bash
+FSROUTER_IMPL=lua python3 spec/test-suite/run.py
 ```
 
 ### Test the Rust implementation
