@@ -11,6 +11,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DENO_DIR = REPO_ROOT / "deno"
+GROOVY_DIR = REPO_ROOT / "groovy"
 GO_DIR = REPO_ROOT / "go"
 JAVA_DIR = REPO_ROOT / "java"
 RUST_DIR = REPO_ROOT / "rust"
@@ -118,6 +119,16 @@ class FsrouterComplianceTests(unittest.TestCase):
             )
             cls.command = ["deno", "run", "--allow-net", "--allow-read", "--allow-run", "--allow-env", str(cls.binary)]
             cls.command_cwd = DENO_DIR
+        elif implementation == "groovy":
+            cls.binary = GROOVY_DIR / "fsrouter.groovy"
+            result = subprocess.run(
+                ["groovyc", str(cls.binary)],
+                cwd=str(GROOVY_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["groovy", str(cls.binary)]
+            cls.command_cwd = GROOVY_DIR
         elif implementation == "go":
             cls.binary = Path(cls.build_dir.name) / binary_name
             result = subprocess.run(

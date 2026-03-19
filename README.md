@@ -9,6 +9,7 @@ This repository contains a protocol/specification plus multiple implementations 
 ```text
 .
 ├── deno/
+├── groovy/
 ├── LICENSE.md
 ├── README.md
 ├── go/
@@ -77,6 +78,19 @@ cd deno && deno run --allow-net --allow-read --allow-run --allow-env fsrouter.ts
 
 - Docs:
   - `deno/README.md`
+
+### Groovy
+
+Located in `groovy/`.
+
+- Run:
+
+```bash
+cd groovy && groovy fsrouter.groovy
+```
+
+- Docs:
+  - `groovy/README.md`
 
 ### Java
 
@@ -158,6 +172,12 @@ python3 spec/test-suite/run.py
 
 ```bash
 FSROUTER_IMPL=deno python3 spec/test-suite/run.py
+```
+
+### Test the Groovy implementation
+
+```bash
+FSROUTER_IMPL=groovy python3 spec/test-suite/run.py
 ```
 
 ### Test the Rust implementation
