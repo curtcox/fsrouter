@@ -12,6 +12,7 @@ This repository contains a protocol/specification plus multiple implementations 
 ├── groovy/
 ├── LICENSE.md
 ├── lua/
+├── perl/
 ├── README.md
 ├── go/
 ├── java/
@@ -110,6 +111,19 @@ cd lua && lua fsrouter.lua
 - Docs:
   - `lua/README.md`
 
+### Perl
+
+Located in `perl/`.
+
+- Run:
+
+```bash
+cd perl && perl fsrouter.pl
+```
+
+- Docs:
+  - `perl/README.md`
+
 ### Java
 
 Located in `java/`.
@@ -202,6 +216,12 @@ FSROUTER_IMPL=groovy python3 spec/test-suite/run.py
 
 ```bash
 FSROUTER_IMPL=lua python3 spec/test-suite/run.py
+```
+
+### Test the Perl implementation
+
+```bash
+FSROUTER_IMPL=perl python3 spec/test-suite/run.py
 ```
 
 ### Test the Rust implementation

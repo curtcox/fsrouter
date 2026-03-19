@@ -15,6 +15,7 @@ GROOVY_DIR = REPO_ROOT / "groovy"
 GO_DIR = REPO_ROOT / "go"
 JAVA_DIR = REPO_ROOT / "java"
 LUA_DIR = REPO_ROOT / "lua"
+PERL_DIR = REPO_ROOT / "perl"
 RUST_DIR = REPO_ROOT / "rust"
 PYTHON_DIR = REPO_ROOT / "python"
 RUBY_DIR = REPO_ROOT / "ruby"
@@ -144,6 +145,16 @@ class FsrouterComplianceTests(unittest.TestCase):
             )
             cls.command = ["lua", str(cls.binary)]
             cls.command_cwd = LUA_DIR
+        elif implementation == "perl":
+            cls.binary = PERL_DIR / "fsrouter.pl"
+            result = subprocess.run(
+                ["perl", "-c", str(cls.binary)],
+                cwd=str(PERL_DIR),
+                capture_output=True,
+                text=True,
+            )
+            cls.command = ["perl", str(cls.binary)]
+            cls.command_cwd = PERL_DIR
         elif implementation == "go":
             cls.binary = Path(cls.build_dir.name) / binary_name
             result = subprocess.run(
