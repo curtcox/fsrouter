@@ -94,7 +94,8 @@ public class FSRouter {
         ListenAddress address = parseListenAddr(listenAddr);
         InetSocketAddress bind = address.host().isEmpty() ? new InetSocketAddress(address.port()) : new InetSocketAddress(address.host(), address.port());
         HttpServer server = HttpServer.create(bind, 0);
-        server.createContext("/", new RouterHandler(root, timeoutSeconds, listenAddr));
+        Path routeDirAbs = Paths.get(routeDir).toAbsolutePath().normalize();
+        server.createContext("/", new RouterHandler(root, timeoutSeconds, listenAddr, routeDirAbs));
         server.setExecutor(Executors.newCachedThreadPool());
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.err.println("shutting down...");
@@ -110,11 +111,13 @@ public class FSRouter {
         private final Node root;
         private final int timeoutSeconds;
         private final String listenAddr;
+        private final Path routeDir;
 
-        private RouterHandler(Node root, int timeoutSeconds, String listenAddr) {
+        private RouterHandler(Node root, int timeoutSeconds, String listenAddr, Path routeDir) {
             this.root = root;
             this.timeoutSeconds = timeoutSeconds;
             this.listenAddr = listenAddr;
+            this.routeDir = routeDir;
         }
 
         @Override
@@ -127,7 +130,7 @@ public class FSRouter {
                 List<String> segs = normalizeRequestPath(rawPath);
                 MatchResult match = root.match(segs);
                 if (match.node() == null || match.node().handlers.isEmpty()) {
-                    status = writeJson(exchange, method, 404, jsonObject(Map.of("error", "not_found", "path", rawPath)));
+                    status = serveFilesystem(exchange, method, routeDir, segs, rawPath);
                     logResult(method, rawPath, status, start);
                     return;
                 }
@@ -151,6 +154,61 @@ public class FSRouter {
             }
             logResult(method, rawPath, status, start);
         }
+    }
+
+    private static int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<String> segs, String rawPath) throws IOException {
+        Path fallback = routeDir;
+        for (String seg : segs) {
+            fallback = fallback.resolve(seg);
+        }
+        if (!Files.exists(fallback)) {
+            return writeJson(exchange, method, 404, jsonObject(Map.of("error", "not_found", "path", rawPath)));
+        }
+        if (Files.isRegularFile(fallback)) {
+            return serveStatic(exchange, method, fallback);
+        }
+        if (Files.isDirectory(fallback)) {
+            return serveDirListing(exchange, method, fallback, rawPath);
+        }
+        return writeJson(exchange, method, 404, jsonObject(Map.of("error", "not_found", "path", rawPath)));
+    }
+
+    private static int serveDirListing(HttpExchange exchange, String method, Path dirPath, String requestPath) throws IOException {
+        List<Path> entries;
+        try (var stream = Files.list(dirPath)) {
+            entries = stream.sorted((a, b) -> a.getFileName().toString().compareTo(b.getFileName().toString())).toList();
+        } catch (IOException e) {
+            return writeJson(exchange, method, 500, jsonObject(Map.of("error", "dir_listing_failed", "message", e.getMessage())));
+        }
+        String title = "Index of " + requestPath;
+        StringBuilder sb = new StringBuilder();
+        sb.append("<!DOCTYPE html><html><head><title>").append(title)
+          .append("</title></head><body><h1>").append(title).append("</h1><ul>");
+        if (!requestPath.equals("/")) {
+            sb.append("<li><a href=\"../\">../</a></li>");
+        }
+        for (Path entry : entries) {
+            String name = entry.getFileName().toString();
+            if (Files.isDirectory(entry)) {
+                sb.append("<li><a href=\"").append(name).append("/\">").append(name).append("/</a></li>");
+            } else {
+                sb.append("<li><a href=\"").append(name).append("\">").append(name).append("</a></li>");
+            }
+        }
+        sb.append("</ul></body></html>");
+        byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
+        Headers headers = exchange.getResponseHeaders();
+        headers.set("Content-Type", "text/html; charset=utf-8");
+        headers.set("Content-Length", Integer.toString(body.length));
+        exchange.sendResponseHeaders(200, method.equals("HEAD") ? -1 : body.length);
+        if (!method.equals("HEAD")) {
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(body);
+            }
+        } else {
+            exchange.close();
+        }
+        return 200;
     }
 
     private static int handleHandler(HttpExchange exchange, String method, Path handlerPath, Map<String, String> params, int timeoutSeconds, String listenAddr) throws IOException {

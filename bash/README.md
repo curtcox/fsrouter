@@ -20,6 +20,21 @@ The authoritative protocol reference is `../spec/PROTOCOL.md`.
 bash fsrouter.sh
 ```
 
+## Open on macOS
+
+```bash
+bash open.sh <file-or-url>
+```
+
+The helper accepts one argument and resolves the route root like this:
+
+- ordinary file: uses the file's parent directory as the route root
+- folder: uses the folder itself as the route root
+- archive: expands it and uses the extracted root directory
+- Git URL: clones or updates the repository and uses the repository root
+
+After resolving the route root, it starts `fsrouter.sh` on a local port in the foreground, streams the server logs to your terminal, opens your browser to the root page, and lets you stop the server with `Ctrl-C`.
+
 ## Quick start
 
 ```bash

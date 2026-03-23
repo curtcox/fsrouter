@@ -504,6 +504,43 @@ sub serve_static {
     return 200;
 }
 
+sub serve_dir_listing {
+    my ($client, $method, $dir_path, $request_path) = @_;
+    opendir(my $dh, $dir_path) or do {
+        return write_json($client, $method, 500, { error => 'dir_listing_failed', message => "$!" });
+    };
+    my @entries = sort grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
+    my $title = 'Index of ' . ($request_path // '/');
+    my @lines = ('<!DOCTYPE html><html><head><title>' . $title . '</title></head><body><h1>' . $title . '</h1><ul>');
+    push @lines, '<li><a href="../">../</a></li>' if defined($request_path) && $request_path ne '/';
+    for my $name (@entries) {
+        my $full = $dir_path . '/' . $name;
+        if (-d $full) {
+            push @lines, '<li><a href="' . $name . '/">' . $name . '/</a></li>';
+        } else {
+            push @lines, '<li><a href="' . $name . '">' . $name . '</a></li>';
+        }
+    }
+    push @lines, '</ul></body></html>';
+    my $body = join("\n", @lines);
+    send_response($client, $method, 200, { 'Content-Type' => 'text/html; charset=utf-8' }, $body);
+    return 200;
+}
+
+sub serve_filesystem_fallback {
+    my ($client, $method, $segs, $abs_route_dir, $request_path) = @_;
+    my $fallback = File::Spec->catfile($abs_route_dir, @{$segs});
+    $fallback = $abs_route_dir if !@{$segs};
+    if (-d $fallback) {
+        return serve_dir_listing($client, $method, $fallback, $request_path);
+    }
+    if (-f $fallback) {
+        return serve_static($client, $method, $fallback);
+    }
+    return write_json($client, $method, 404, { error => 'not_found', path => $request_path });
+}
+
 sub parse_request {
     my ($client) = @_;
     my $request_line = <$client>;
@@ -600,8 +637,8 @@ sub main {
     my $listen_addr = env_or('LISTEN_ADDR', ':8080');
     my $timeout_seconds = parse_timeout(env_or('COMMAND_TIMEOUT', '30'));
 
-    my ($root, $abs_dir);
-    eval { ($root, $abs_dir) = build_tree($route_dir); 1 } or do {
+    my ($root, $abs_route_dir);
+    eval { ($root, $abs_route_dir) = build_tree($route_dir); 1 } or do {
         my $err = $@ || 'unknown error';
         chomp $err;
         print STDERR "failed to scan $route_dir: $err\n";
@@ -651,7 +688,7 @@ sub main {
             my $segs = normalize_request_path($request->{path});
             my ($node, $params) = match_node($root, $segs);
             if (!defined $node || !keys %{ $node->{handlers} }) {
-                $status = write_json($client, $request->{method}, 404, { error => 'not_found', path => $request->{path} });
+                $status = serve_filesystem_fallback($client, $request->{method}, $segs, $abs_route_dir, $request->{path});
                 1;
             } else {
                 my $handler_path = $node->{handlers}{ $request->{method} };

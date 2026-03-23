@@ -79,6 +79,12 @@ Located in `bash/`.
 cd bash && bash fsrouter.sh
 ```
 
+- Open on macOS:
+
+```bash
+cd bash && bash open.sh <file-or-url>
+```
+
 - Docs:
   - `bash/README.md`
 

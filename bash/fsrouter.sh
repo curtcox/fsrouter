@@ -502,6 +502,63 @@ serve_static() {
   printf '200'
 }
 
+serve_dir_listing() {
+  local response_file="$1"
+  local method="$2"
+  local dir_path="$3"
+  local request_path="$4"
+  local title="Index of $request_path"
+  local body_file
+  body_file=$(mktemp)
+  printf '<!DOCTYPE html><html><head><title>%s</title></head><body><h1>%s</h1><ul>' "$title" "$title" > "$body_file"
+  if [[ "$request_path" != '/' ]]; then
+    printf '<li><a href="../">../</a></li>' >> "$body_file"
+  fi
+  local name
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    if [[ -d "$dir_path/$name" ]]; then
+      printf '<li><a href="%s/">%s/</a></li>' "$name" "$name" >> "$body_file"
+    else
+      printf '<li><a href="%s">%s</a></li>' "$name" "$name" >> "$body_file"
+    fi
+  done < <(ls -1 "$dir_path" 2>/dev/null | sort)
+  printf '</ul></body></html>' >> "$body_file"
+  local extra_headers
+  extra_headers=$(mktemp)
+  : > "$extra_headers"
+  write_response_file "$response_file" "$method" 200 'text/html; charset=utf-8' "$body_file" "$extra_headers"
+  rm -f "$body_file" "$extra_headers"
+  printf '200'
+}
+
+serve_filesystem_fallback() {
+  local response_file="$1"
+  local method="$2"
+  local request_path="$3"
+  local normalized="$4"
+  local route_dir_abs="$ROUTE_DIR_ABS"
+  local fallback="$route_dir_abs"
+  local seg
+  if [[ -n "$normalized" ]]; then
+    while IFS= read -r seg; do
+      [[ -n "$seg" ]] && fallback="$fallback/$seg"
+    done <<< "$normalized"
+  fi
+  if [[ -d "$fallback" ]]; then
+    serve_dir_listing "$response_file" "$method" "$fallback" "$request_path"
+    return
+  fi
+  if [[ -f "$fallback" ]]; then
+    serve_static "$response_file" "$method" "$fallback"
+    return
+  fi
+  local escaped_path
+  escaped_path=$(json_escape "$request_path")
+  write_json_response_file "$response_file" "$method" 404 "{\"error\":\"not_found\",\"path\":\"$escaped_path\"}"
+  printf '404'
+}
+
 handle_request() {
   local req_fifo="$1"
   local resp_fifo="$2"
@@ -568,11 +625,10 @@ handle_request() {
   local response_tmp
   response_tmp=$(mktemp)
   local status='500'
+  local normalized_segs
+  normalized_segs=$(normalize_request_path "$request_path") || true
   if ! match_route "$request_path"; then
-    local escaped_path
-    escaped_path=$(json_escape "$request_path")
-    write_json_response_file "$response_tmp" "$request_method" 404 "{\"error\":\"not_found\",\"path\":\"$escaped_path\"}"
-    status='404'
+    status=$(serve_filesystem_fallback "$response_tmp" "$request_method" "$request_path" "$normalized_segs")
   else
     local chosen_method="$request_method"
     if ! find_handler_for_method "$MATCH_ROUTE" "$chosen_method"; then

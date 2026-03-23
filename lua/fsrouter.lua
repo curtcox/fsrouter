@@ -578,6 +578,68 @@ local function serve_static(client, method, handler_path)
   return 200
 end
 
+local function is_dir(path)
+  local process = io.popen("test -d " .. string.format("%q", path) .. " && printf 1 || printf 0", "r")
+  if not process then return false end
+  local out = process:read("*a") or ""
+  process:close()
+  return out:match("1") ~= nil
+end
+
+local function is_file(path)
+  local f = io.open(path, "r")
+  if f then f:close() return true end
+  return false
+end
+
+local function list_dir_entries(path)
+  local process = io.popen("ls -1 " .. string.format("%q", path) .. " 2>/dev/null", "r")
+  if not process then return {} end
+  local entries = {}
+  for line in process:lines() do
+    entries[#entries + 1] = line
+  end
+  process:close()
+  table.sort(entries)
+  return entries
+end
+
+local function serve_dir_listing(client, method, dir_path, request_path)
+  local entries = list_dir_entries(dir_path)
+  local title = "Index of " .. (request_path or "/")
+  local parts = { "<!DOCTYPE html><html><head><title>" .. title .. "</title></head><body><h1>" .. title .. "</h1><ul>" }
+  if request_path and request_path ~= "/" then
+    parts[#parts + 1] = '<li><a href="../">../</a></li>'
+  end
+  for _, name in ipairs(entries) do
+    local full = dir_path .. "/" .. name
+    if is_dir(full) then
+      parts[#parts + 1] = '<li><a href="' .. name .. '/">' .. name .. '/</a></li>'
+    else
+      parts[#parts + 1] = '<li><a href="' .. name .. '">' .. name .. '</a></li>'
+    end
+  end
+  parts[#parts + 1] = "</ul></body></html>"
+  local body = table.concat(parts, "\n")
+  send_response(client, method, 200, { ["Content-Type"] = "text/html; charset=utf-8" }, body)
+  return 200
+end
+
+local function serve_filesystem_fallback(client, method, segs, route_dir, request_path)
+  local parts = { route_dir }
+  for _, seg in ipairs(segs) do
+    parts[#parts + 1] = seg
+  end
+  local fallback = table.concat(parts, "/")
+  if is_dir(fallback) then
+    return serve_dir_listing(client, method, fallback, request_path)
+  end
+  if is_file(fallback) then
+    return serve_static(client, method, fallback)
+  end
+  return write_json(client, method, 404, { error = "not_found", path = request_path })
+end
+
 local function parse_request(client)
   local request_line, err = client:receive("*l")
   if not request_line then
@@ -663,6 +725,14 @@ local function snapshot_env()
   return system.getenvs()
 end
 
+local function realpath(path)
+  local process = io.popen("realpath " .. string.format("%q", path) .. " 2>/dev/null", "r")
+  if not process then return path end
+  local result = process:read("*l") or path
+  process:close()
+  return result ~= "" and result or path
+end
+
 local function main()
   local route_dir = env_or("ROUTE_DIR", "./routes")
   local listen_addr = env_or("LISTEN_ADDR", ":8080")
@@ -673,6 +743,7 @@ local function main()
     io.stderr:flush()
     return 1
   end
+  local abs_route_dir = realpath(route_dir)
 
   print_routes(root, route_dir)
   local host, port = parse_listen_addr(listen_addr)
@@ -697,7 +768,7 @@ local function main()
           local segs = normalize_request_path(request.path)
           local node, params = match_node(root, segs)
           if not node or next(node.handlers) == nil then
-            status = write_json(client, request.method, 404, { error = "not_found", path = request.path })
+            status = serve_filesystem_fallback(client, request.method, segs, abs_route_dir, request.path)
             return
           end
           local handler_path = node.handlers[request.method]

@@ -441,6 +441,60 @@ int writeCgiResponse(HttpExchange exchange, String method, byte[] raw, int exitC
     status
 }
 
+int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<String> segs, String rawPath) {
+    Path fallback = routeDir
+    for (String seg : segs) {
+        fallback = fallback.resolve(seg)
+    }
+    if (!Files.exists(fallback)) {
+        return writeJson(exchange, method, 404, [error: 'not_found', path: rawPath])
+    }
+    if (Files.isRegularFile(fallback)) {
+        return serveStatic(exchange, method, fallback)
+    }
+    if (Files.isDirectory(fallback)) {
+        return serveDirListing(exchange, method, fallback, rawPath)
+    }
+    return writeJson(exchange, method, 404, [error: 'not_found', path: rawPath])
+}
+
+int serveDirListing(HttpExchange exchange, String method, Path dirPath, String requestPath) {
+    List<Path> entries
+    try {
+        entries = Files.list(dirPath).sorted { a, b -> a.fileName.toString() <=> b.fileName.toString() }.toList()
+    } catch (IOException err) {
+        return writeJson(exchange, method, 500, [error: 'dir_listing_failed', message: err.message])
+    }
+    String title = 'Index of ' + requestPath
+    StringBuilder sb = new StringBuilder()
+    sb.append('<!DOCTYPE html><html><head><title>').append(title)
+      .append('</title></head><body><h1>').append(title).append('</h1><ul>')
+    if (requestPath != '/') {
+        sb.append('<li><a href="../">../</a></li>')
+    }
+    for (Path entry : entries) {
+        String name = entry.fileName.toString()
+        if (Files.isDirectory(entry)) {
+            sb.append('<li><a href="').append(name).append('/">').append(name).append('/</a></li>')
+        } else {
+            sb.append('<li><a href="').append(name).append('">').append(name).append('</a></li>')
+        }
+    }
+    sb.append('</ul></body></html>')
+    byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8)
+    Headers headers = exchange.responseHeaders
+    headers.set('Content-Type', 'text/html; charset=utf-8')
+    headers.set('Content-Length', Integer.toString(body.length))
+    if (method == 'HEAD') {
+        exchange.sendResponseHeaders(200, -1)
+        exchange.close()
+    } else {
+        exchange.sendResponseHeaders(200, body.length)
+        exchange.responseBody.withCloseable { OutputStream out -> out.write(body) }
+    }
+    return 200
+}
+
 int serveStatic(HttpExchange exchange, String method, Path handlerPath) {
     try {
         byte[] data = Files.readAllBytes(handlerPath)
@@ -540,6 +594,7 @@ class RouterHandler implements HttpHandler {
     Node root
     int timeoutSeconds
     String listenAddr
+    Path routeDir
     def support
 
     @Override
@@ -554,7 +609,7 @@ class RouterHandler implements HttpHandler {
             Node node = (Node) match.node
             Map<String, String> params = (Map<String, String>) (match.params ?: [:])
             if (node == null || node.handlers.isEmpty()) {
-                status = support.writeJson(exchange, method, 404, [error: 'not_found', path: rawPath])
+                status = support.serveFilesystem(exchange, method, routeDir, segs, rawPath)
                 support.logResult(method, rawPath, status, start)
                 return
             }
@@ -611,7 +666,8 @@ int main() {
     ListenAddress address = parseListenAddr(listenAddr)
     InetSocketAddress bind = address.host.isEmpty() ? new InetSocketAddress(address.port) : new InetSocketAddress(address.host, address.port)
     HttpServer server = HttpServer.create(bind, 0)
-    server.createContext('/', new RouterHandler(root: root, timeoutSeconds: timeoutSeconds, listenAddr: listenAddr, support: this))
+    Path routeDirAbs = Paths.get(routeDir).toAbsolutePath().normalize()
+    server.createContext('/', new RouterHandler(root: root, timeoutSeconds: timeoutSeconds, listenAddr: listenAddr, routeDir: routeDirAbs, support: this))
     server.executor = Executors.newCachedThreadPool()
     Runtime.runtime.addShutdownHook(new Thread({
         System.err.println('shutting down...')

@@ -41,11 +41,12 @@ class Node:
 class FsrouterServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address: tuple[str, int], handler_class, root: Node, timeout_seconds: int, listen_addr: str):
+    def __init__(self, server_address: tuple[str, int], handler_class, root: Node, timeout_seconds: int, listen_addr: str, route_dir_abs: Path):
         super().__init__(server_address, handler_class)
         self.root = root
         self.command_timeout = timeout_seconds
         self.listen_addr = listen_addr
+        self.route_dir_abs = route_dir_abs
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -85,8 +86,8 @@ class Handler(BaseHTTPRequestHandler):
 
         node, params = self.server.root.match(segs)
         if node is None or not node.handlers:
-            self.write_json(404, {"error": "not_found", "path": parsed.path})
-            self.log_result(404, start)
+            status = self.serve_filesystem_fallback(segs, parsed.path)
+            self.log_result(status, start)
             return
 
         handler_path = node.handlers.get(self.command)
@@ -151,6 +152,41 @@ class Handler(BaseHTTPRequestHandler):
             raw = stderr
 
         return self.write_cgi_response(raw, exit_code)
+
+    def serve_filesystem_fallback(self, segs: list[str], request_path: str) -> int:
+        fallback = self.server.route_dir_abs.joinpath(*segs) if segs else self.server.route_dir_abs
+        if fallback.is_file():
+            return self.serve_static(fallback)
+        if fallback.is_dir():
+            return self.serve_dir_listing(fallback, request_path)
+        self.write_json(404, {"error": "not_found", "path": request_path})
+        return 404
+
+    def serve_dir_listing(self, dir_path: Path, request_path: str) -> int:
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        except OSError as err:
+            self.write_json(500, {"error": "dir_listing_failed", "message": str(err)})
+            return 500
+        title = f"Index of {request_path or '/'}"
+        lines = [f"<!DOCTYPE html><html><head><title>{title}</title></head><body><h1>{title}</h1><ul>"]
+        if request_path and request_path != "/":
+            lines.append("<li><a href=\"../\">../</a></li>")
+        for entry in entries:
+            name = entry.name
+            if entry.is_dir():
+                lines.append(f"<li><a href=\"{name}/\">{name}/</a></li>")
+            else:
+                lines.append(f"<li><a href=\"{name}\">{name}</a></li>")
+        lines.append("</ul></body></html>")
+        body = "\n".join(lines).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        return 200
 
     def serve_static(self, handler_path: Path) -> int:
         try:
@@ -445,7 +481,7 @@ def main() -> int:
 
     print_routes(root, route_dir)
     host, port = parse_listen_addr(listen_addr)
-    server = FsrouterServer((host, port), Handler, root, timeout_seconds, listen_addr)
+    server = FsrouterServer((host, port), Handler, root, timeout_seconds, listen_addr, Path(route_dir).resolve())
 
     def shutdown_handler(signum, frame):
         sys.stderr.write("shutting down...\n")

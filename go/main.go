@@ -190,8 +190,9 @@ func joinPrefix(prefix, seg string) string {
 // ---------------------------------------------------------------------------
 
 type server struct {
-	root    *node
-	timeout time.Duration
+	root     *node
+	timeout  time.Duration
+	routeDir string
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -200,8 +201,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	nd, params := s.root.match(segs)
 	if nd == nil || len(nd.handlers) == 0 {
-		writeJSON(w, 404, `{"error":"not_found","path":%q}`, r.URL.Path)
-		log.Printf("%s %s → 404 (%v)", r.Method, r.URL.Path, time.Since(start))
+		status := s.serveFilesystem(w, r, segs)
+		log.Printf("%s %s → %d (%v)", r.Method, r.URL.Path, status, time.Since(start))
 		return
 	}
 
@@ -217,6 +218,59 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	status := s.handle(w, r, handlerPath, params)
 	log.Printf("%s %s → %d (%v)", r.Method, r.URL.Path, status, time.Since(start))
+}
+
+func (s *server) serveFilesystem(w http.ResponseWriter, r *http.Request, segs []string) int {
+	parts := make([]string, 0, len(segs)+1)
+	parts = append(parts, s.routeDir)
+	parts = append(parts, segs...)
+	fullPath := filepath.Join(parts...)
+
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		writeJSON(w, 404, `{"error":"not_found","path":%q}`, r.URL.Path)
+		return 404
+	}
+	if !info.IsDir() {
+		http.ServeFile(w, r, fullPath)
+		return 200
+	}
+	return s.serveDirListing(w, r, fullPath)
+}
+
+func (s *server) serveDirListing(w http.ResponseWriter, r *http.Request, dirPath string) int {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		writeJSON(w, 500, `{"error":"dir_listing_failed","message":%q}`, err.Error())
+		return 500
+	}
+	title := "Index of " + r.URL.Path
+	var sb strings.Builder
+	sb.WriteString("<!DOCTYPE html><html><head><title>")
+	sb.WriteString(title)
+	sb.WriteString("</title></head><body><h1>")
+	sb.WriteString(title)
+	sb.WriteString("</h1><ul>")
+	if r.URL.Path != "/" {
+		sb.WriteString(`<li><a href="../">../</a></li>`)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			fmt.Fprintf(&sb, `<li><a href="%s/">%s/</a></li>`, name, name)
+		} else {
+			fmt.Fprintf(&sb, `<li><a href="%s">%s</a></li>`, name, name)
+		}
+	}
+	sb.WriteString("</ul></body></html>")
+	body := sb.String()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(200)
+	if r.Method != "HEAD" {
+		fmt.Fprint(w, body)
+	}
+	return 200
 }
 
 func (s *server) handle(w http.ResponseWriter, r *http.Request, path string, params map[string]string) int {
@@ -468,8 +522,9 @@ func main() {
 	srv := &http.Server{
 		Addr: addr,
 		Handler: &server{
-			root:    root,
-			timeout: time.Duration(timeoutSec) * time.Second,
+			root:     root,
+			timeout:  time.Duration(timeoutSec) * time.Second,
+			routeDir: func() string { abs, _ := filepath.Abs(routeDir); return abs }(),
 		},
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: time.Duration(timeoutSec+5) * time.Second,

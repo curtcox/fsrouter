@@ -62,6 +62,7 @@ struct AppState {
     root: Arc<Node>,
     timeout: Duration,
     listen_addr: String,
+    route_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -84,10 +85,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     log_routes(&root, &route_dir);
 
+    let route_dir_abs = std::fs::canonicalize(&route_dir)
+        .unwrap_or_else(|_| PathBuf::from(&route_dir));
     let state = Arc::new(AppState {
         root: Arc::new(root),
         timeout: Duration::from_secs(timeout_sec),
         listen_addr: addr.clone(),
+        route_dir: route_dir_abs,
     });
 
     let app = Router::new()
@@ -139,20 +143,14 @@ async fn handle_request(
     let (node, params) = match state.root.match_segments(&segs) {
         Some(result) => result,
         None => {
-            let response = json_response(
-                StatusCode::NOT_FOUND,
-                json!({"error":"not_found","path":raw_path.clone()}),
-            );
+            let response = serve_filesystem(&state.route_dir, &segs, &raw_path, method.as_str()).await;
             log_request(method.as_str(), &raw_path, response.status(), start.elapsed());
             return response;
         }
     };
 
     if node.handlers.is_empty() {
-        let response = json_response(
-            StatusCode::NOT_FOUND,
-            json!({"error":"not_found","path":raw_path.clone()}),
-        );
+        let response = serve_filesystem(&state.route_dir, &segs, &raw_path, method.as_str()).await;
         log_request(method.as_str(), &raw_path, response.status(), start.elapsed());
         return response;
     }
@@ -668,6 +666,59 @@ fn join_prefix(prefix: &str, segment: &str) -> String {
     } else {
         format!("{prefix}/{segment}")
     }
+}
+
+async fn serve_filesystem(route_dir: &Path, segs: &[String], raw_path: &str, method: &str) -> Response<Body> {
+    let full_path: PathBuf = segs.iter().fold(route_dir.to_path_buf(), |acc, s| acc.join(s));
+    match tokio::fs::metadata(&full_path).await {
+        Err(_) => json_response(StatusCode::NOT_FOUND, json!({"error":"not_found","path":raw_path})),
+        Ok(meta) if meta.is_file() => serve_static(&full_path, method == "HEAD").await,
+        Ok(_) => serve_dir_listing(&full_path, raw_path, method == "HEAD").await,
+    }
+}
+
+async fn serve_dir_listing(dir_path: &Path, request_path: &str, suppress_body: bool) -> Response<Body> {
+    let mut rd = match tokio::fs::read_dir(dir_path).await {
+        Err(err) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"dir_listing_failed","message":err.to_string()}),
+            );
+        }
+        Ok(rd) => rd,
+    };
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+        entries.push((entry.file_name().to_string_lossy().to_string(), is_dir));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let title = format!("Index of {}", request_path);
+    let mut html = format!(
+        "<!DOCTYPE html><html><head><title>{title}</title></head><body><h1>{title}</h1><ul>"
+    );
+    if request_path != "/" {
+        html.push_str(r#"<li><a href="../">../</a></li>"#);
+    }
+    for (name, is_dir) in &entries {
+        if *is_dir {
+            html.push_str(&format!(r#"<li><a href="{name}/">{name}/</a></li>"#));
+        } else {
+            html.push_str(&format!(r#"<li><a href="{name}">{name}</a></li>"#));
+        }
+    }
+    html.push_str("</ul></body></html>");
+
+    let body_bytes = html.into_bytes();
+    let len = body_bytes.len();
+    let mut response = Response::new(if suppress_body { Body::empty() } else { Body::from(body_bytes) });
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    if let Ok(v) = HeaderValue::from_str(&len.to_string()) {
+        response.headers_mut().insert("content-length", v);
+    }
+    response
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Body> {

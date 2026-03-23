@@ -338,6 +338,44 @@ rescue StandardError => e
   500
 end
 
+def serve_filesystem_fallback(req, res, segs, route_dir_abs)
+  fallback = File.join(route_dir_abs, *segs)
+  if File.file?(fallback)
+    return serve_static(req, res, fallback)
+  elsif File.directory?(fallback)
+    return serve_dir_listing(req, res, fallback, req.path)
+  end
+  json_response(res, req, 404, { error: 'not_found', path: req.path })
+  404
+end
+
+def serve_dir_listing(req, res, dir_path, request_path)
+  begin
+    entries = Dir.entries(dir_path).reject { |e| e == '.' || e == '..' }.sort
+  rescue StandardError => e
+    json_response(res, req, 500, { error: 'dir_listing_failed', message: e.message })
+    return 500
+  end
+  title = "Index of #{request_path || '/'}"
+  lines = ["<!DOCTYPE html><html><head><title>#{title}</title></head><body><h1>#{title}</h1><ul>"]
+  lines << '<li><a href="../">../</a></li>' if request_path && request_path != '/'
+  entries.each do |name|
+    full = File.join(dir_path, name)
+    if File.directory?(full)
+      lines << "<li><a href=\"#{name}/\">#{name}/</a></li>"
+    else
+      lines << "<li><a href=\"#{name}\">#{name}</a></li>"
+    end
+  end
+  lines << '</ul></body></html>'
+  body = lines.join("\n").encode('UTF-8')
+  res.status = 200
+  res['Content-Type'] = 'text/html; charset=utf-8'
+  res['Content-Length'] = body.bytesize.to_s
+  res.body = req.request_method == 'HEAD' ? '' : body
+  200
+end
+
 def parse_listen_addr(addr)
   return ['0.0.0.0', addr[1..].to_i] if addr.start_with?(':')
   if addr.start_with?('[') && addr.include?(']')
@@ -364,8 +402,7 @@ def process_request(req, res, root, server_config)
     segs = normalize_request_path(req.path)
     node, params = root.match(segs)
     if node.nil? || node.handlers.empty?
-      json_response(res, req, 404, { error: 'not_found', path: req.path })
-      status = 404
+      status = serve_filesystem_fallback(req, res, segs, server_config[:route_dir_abs])
     else
       handler_path = node.handlers[req.request_method]
       handler_path ||= node.handlers['GET'] if req.request_method == 'HEAD'
@@ -445,7 +482,8 @@ end
 
 print_routes(root, route_dir)
 host, port = parse_listen_addr(listen_addr)
-server_config = { root: root, command_timeout: timeout_seconds, listen_addr: listen_addr }
+route_dir_abs = File.realpath(route_dir)
+server_config = { root: root, command_timeout: timeout_seconds, listen_addr: listen_addr, route_dir_abs: route_dir_abs }
 
 server = WEBrick::HTTPServer.new(
   BindAddress: host,

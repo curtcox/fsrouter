@@ -424,6 +424,23 @@ async function executeHandler(handlerPath: string, request: Request, params: Rec
   return new Response(request.method === "HEAD" ? null : responseBody(body), { status: responseStatus, headers });
 }
 
+const MIME_TYPES: Record<string, string> = {
+  ".html": "text/html", ".htm": "text/html",
+  ".css": "text/css", ".js": "application/javascript",
+  ".json": "application/json", ".xml": "application/xml",
+  ".txt": "text/plain", ".md": "text/plain",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".svg": "image/svg+xml", ".ico": "image/x-icon",
+  ".pdf": "application/pdf", ".zip": "application/zip",
+  ".sh": "text/plain", ".py": "text/plain", ".rb": "text/plain",
+};
+
+function mimeTypeFor(path: string): string {
+  const dot = path.lastIndexOf(".");
+  if (dot === -1) return "application/octet-stream";
+  return MIME_TYPES[path.slice(dot).toLowerCase()] ?? "application/octet-stream";
+}
+
 async function serveStatic(handlerPath: string, request: Request): Promise<Response> {
   try {
     const body = await Deno.readFile(handlerPath);
@@ -457,7 +474,59 @@ function logResult(request: Request, status: number, start: number): void {
   console.error(`${request.method} ${url.pathname} → ${status} (${elapsed.toFixed(6)}s)`);
 }
 
-async function handleRequest(request: Request, root: Node, timeoutSeconds: number, listenAddr: string, remoteAddr: Deno.NetAddr | null): Promise<Response> {
+async function serveFilesystem(routeDir: string, segs: string[], requestPath: string, method: string): Promise<Response> {
+  const fullPath = segs.length === 0 ? routeDir : [routeDir, ...segs].join("/");
+  let info: Deno.FileInfo;
+  try {
+    info = await Deno.stat(fullPath);
+  } catch {
+    return jsonResponse(404, { error: "not_found", path: requestPath }, method);
+  }
+  if (!info.isDirectory) {
+    try {
+      const body = await Deno.readFile(fullPath);
+      const headers = new Headers();
+      headers.set("content-type", mimeTypeFor(fullPath));
+      headers.set("content-length", String(body.length));
+      return new Response(method === "HEAD" ? null : responseBody(body), { status: 200, headers });
+    } catch (error) {
+      return jsonResponse(500, { error: "static_read_failed", message: error instanceof Error ? error.message : String(error) }, method);
+    }
+  }
+  return serveDirListing(fullPath, requestPath, method);
+}
+
+async function serveDirListing(dirPath: string, requestPath: string, method: string): Promise<Response> {
+  const entries: Array<{ name: string; isDir: boolean }> = [];
+  try {
+    for await (const entry of Deno.readDir(dirPath)) {
+      entries.push({ name: entry.name, isDir: entry.isDirectory });
+    }
+  } catch (error) {
+    return jsonResponse(500, { error: "dir_listing_failed", message: error instanceof Error ? error.message : String(error) }, method);
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  const title = `Index of ${requestPath}`;
+  let html = `<!DOCTYPE html><html><head><title>${title}</title></head><body><h1>${title}</h1><ul>`;
+  if (requestPath !== "/") {
+    html += `<li><a href="../">../</a></li>`;
+  }
+  for (const entry of entries) {
+    if (entry.isDir) {
+      html += `<li><a href="${entry.name}/">${entry.name}/</a></li>`;
+    } else {
+      html += `<li><a href="${entry.name}">${entry.name}</a></li>`;
+    }
+  }
+  html += "</ul></body></html>";
+  const body = textEncoder.encode(html);
+  const headers = new Headers();
+  headers.set("content-type", "text/html; charset=utf-8");
+  headers.set("content-length", String(body.length));
+  return new Response(method === "HEAD" ? null : responseBody(body), { status: 200, headers });
+}
+
+async function handleRequest(request: Request, root: Node, timeoutSeconds: number, listenAddr: string, remoteAddr: Deno.NetAddr | null, routeDir: string): Promise<Response> {
   const start = performance.now();
   const url = new URL(request.url);
   let response: Response;
@@ -466,7 +535,7 @@ async function handleRequest(request: Request, root: Node, timeoutSeconds: numbe
     const segs = normalizeRequestPath(url.pathname);
     const match = root.match(segs);
     if (!match.node || match.node.handlers.size === 0) {
-      response = jsonResponse(404, { error: "not_found", path: url.pathname }, request.method);
+      response = await serveFilesystem(routeDir, segs, url.pathname, request.method);
       logResult(request, response.status, start);
       return response;
     }
@@ -527,9 +596,10 @@ async function main(): Promise<void> {
   Deno.addSignalListener("SIGTERM", shutdown);
 
   console.error(`listening on ${listenAddr} (timeout ${timeoutSeconds}s)`);
+  const absRouteDir = await Deno.realPath(routeDir).catch(() => routeDir);
   const server = Deno.serve({ hostname: bind.hostname, port: bind.port, signal: controller.signal }, (request: Request, info: Deno.ServeHandlerInfo<Deno.NetAddr>) => {
     const remoteAddr = info.remoteAddr?.transport === "tcp" ? info.remoteAddr : null;
-    return handleRequest(request, root, timeoutSeconds, listenAddr, remoteAddr);
+    return handleRequest(request, root, timeoutSeconds, listenAddr, remoteAddr, absRouteDir);
   });
   await server.finished;
 }

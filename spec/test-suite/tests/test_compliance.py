@@ -450,6 +450,29 @@ printf '{\"done\":true}'"""))
                 self.assertEqual(status, 200)
                 self.assertEqual(self.parse_json(body), {"run_id": "run-001", "per_page": "20"})
 
+    def test_arbitrary_file_in_route_dir_is_served_directly(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            notes = routes / "notes.txt"
+            notes.write_text("hello from notes", encoding="utf-8")
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, headers, body = server.request("GET", "/notes.txt")
+                self.assertEqual(status, 200)
+                self.assertIn("text/plain", headers.get_content_type())
+                self.assertEqual(body.decode("utf-8"), "hello from notes")
+
+    def test_directory_in_route_dir_returns_html_listing(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            docs = routes / "docs"
+            docs.mkdir()
+            (docs / "readme.txt").write_text("doc content", encoding="utf-8")
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, headers, body = server.request("GET", "/docs")
+                self.assertEqual(status, 200)
+                self.assertIn("text/html", headers.get_content_type())
+                self.assertIn(b"readme.txt", body)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

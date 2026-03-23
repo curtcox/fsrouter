@@ -124,9 +124,34 @@ handler for the request's HTTP method.
 - If no, but handlers exist for *other* methods at that node, return
   **405 Method Not Allowed** with an `Allow` header listing the available
   methods.
-- If path matching itself failed (no node matched), return **404 Not Found**.
+- If path matching itself failed (no node matched), proceed to **§4.4 Filesystem Fallback**.
 
-### 4.4. HEAD requests
+### 4.4. Filesystem Fallback
+
+When no handler route matches the request path (step 3 of §4.2 fails at any
+level, or the matched node has no handler files at all), the server attempts to
+serve the path directly from the filesystem before returning 404.
+
+1. Construct the candidate path by joining `ROUTE_DIR` with the normalized
+   path segments. Because `..` segments are already rejected (§4.1), the
+   result is guaranteed to remain within `ROUTE_DIR`.
+2. **Regular file** — if the candidate path is a regular file, serve it:
+   - Status: `200 OK`
+   - `Content-Type`: detected from the file extension (same logic as §5.2).
+   - Body: the raw file contents.
+3. **Directory** — if the candidate path is a directory:
+   - Status: `200 OK`
+   - `Content-Type: text/html; charset=utf-8`
+   - Body: a simple HTML directory listing with hyperlinks to each entry.
+     Subdirectories are shown with a trailing `/`.
+4. **Not found** — otherwise return **404 Not Found** (§8.1).
+
+The filesystem fallback is intentionally a last resort. Handler routes always
+take priority. The 405 response is returned before this fallback is attempted
+(if a node matched but lacked the requested method, the server returns 405
+without consulting the filesystem).
+
+### 4.5. HEAD requests
 
 If a `HEAD` method file exists, it is used. If not, but a `GET` method file
 exists, the server SHOULD handle `HEAD` by dispatching to the `GET` handler
@@ -499,3 +524,5 @@ tests. Each test corresponds to an entry in `spec/test-suite/tests/`.
 | 18 | Handler cwd is set to handler's parent directory | §5.3.2 |
 | 19 | Trailing slashes are normalized | §4.1 |
 | 20 | Hyphens in param/query names become underscores | §7.2.2, §7.2.3 |
+| 21 | Arbitrary file at ROUTE_DIR/<path> is served directly (§4.4 fallback) | §4.4 |
+| 22 | Directory at ROUTE_DIR/<path> returns HTML listing (§4.4 fallback) | §4.4 |
