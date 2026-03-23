@@ -502,6 +502,74 @@ serve_static() {
   printf '200'
 }
 
+find_directory_index() {
+  local dir_path="$1"
+  DIRECTORY_INDEX_KIND=''
+  DIRECTORY_INDEX_PATH=''
+  local candidate
+  for candidate in "$dir_path/index.html" "$dir_path/index.htm"; do
+    if [[ -f "$candidate" ]]; then
+      DIRECTORY_INDEX_KIND='static'
+      DIRECTORY_INDEX_PATH="$candidate"
+      return 0
+    fi
+  done
+  local name
+  while IFS= read -r name; do
+    [[ "$name" == index.* ]] || continue
+    candidate="$dir_path/$name"
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      DIRECTORY_INDEX_KIND='exec'
+      DIRECTORY_INDEX_PATH="$candidate"
+      return 0
+    fi
+  done < <(ls -1 "$dir_path" 2>/dev/null | sort)
+  return 1
+}
+
+serve_executable_fallback() {
+  local response_file="$1"
+  local handler_path="$2"
+  local request_body_file="$3"
+  local request_method="$4"
+  local request_target="$5"
+  local request_path="$6"
+  local query_string="$7"
+  local content_type="$8"
+  local content_length="$9"
+  local peer="${10}"
+  local host_header="${11}"
+  local listen_addr="${12}"
+  local timeout_seconds="${13}"
+  run_handler "$handler_path" "$request_body_file" "$request_method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+  if (( HANDLER_EXIT_CODE == 142 || HANDLER_EXIT_CODE == 124 )); then
+    write_json_response_file "$response_file" "$request_method" 504 "{\"error\":\"handler_timeout\",\"timeout_seconds\":$timeout_seconds}"
+    rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+    printf '504'
+    return
+  fi
+  if (( HANDLER_EXIT_CODE == 127 )); then
+    write_json_response_file "$response_file" "$request_method" 502 '{"error":"exec_failed","message":"exec_failed"}'
+    rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+    printf '502'
+    return
+  fi
+  local raw_for_parse
+  raw_for_parse="$HANDLER_STDOUT_FILE"
+  if [[ ! -s "$raw_for_parse" && "$HANDLER_EXIT_CODE" != '0' && -s "$HANDLER_STDERR_FILE" ]]; then
+    raw_for_parse="$HANDLER_STDERR_FILE"
+  fi
+  parse_cgi_response "$raw_for_parse" "$(exit_to_status "$HANDLER_EXIT_CODE")"
+  write_response_file "$response_file" "$request_method" "$CGI_STATUS" "$CGI_CONTENT_TYPE" "$CGI_BODY_FILE" "$CGI_HEADERS_FILE"
+  if [[ -s "$HANDLER_STDERR_FILE" ]]; then
+    local stderr_text
+    stderr_text=$(tr -d '\r' < "$HANDLER_STDERR_FILE" | tr '\n' ' ')
+    printf '  [handler stderr] %s\n' "$stderr_text" >&2
+  fi
+  rm -f "$CGI_BODY_FILE" "$CGI_HEADERS_FILE" "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+  printf '%s' "$CGI_STATUS"
+}
+
 serve_dir_listing() {
   local response_file="$1"
   local method="$2"
@@ -537,6 +605,15 @@ serve_filesystem_fallback() {
   local method="$2"
   local request_path="$3"
   local normalized="$4"
+  local request_body_file="$5"
+  local request_target="$6"
+  local query_string="$7"
+  local content_type="$8"
+  local content_length="$9"
+  local peer="${10}"
+  local host_header="${11}"
+  local listen_addr="${12}"
+  local timeout_seconds="${13}"
   local route_dir_abs="$ROUTE_DIR_ABS"
   local fallback="$route_dir_abs"
   local seg
@@ -546,6 +623,14 @@ serve_filesystem_fallback() {
     done <<< "$normalized"
   fi
   if [[ -d "$fallback" ]]; then
+    if find_directory_index "$fallback"; then
+      if [[ "$DIRECTORY_INDEX_KIND" == 'static' ]]; then
+        serve_static "$response_file" "$method" "$DIRECTORY_INDEX_PATH"
+        return
+      fi
+      serve_executable_fallback "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+      return
+    fi
     serve_dir_listing "$response_file" "$method" "$fallback" "$request_path"
     return
   fi
@@ -628,7 +713,7 @@ handle_request() {
   local normalized_segs
   normalized_segs=$(normalize_request_path "$request_path") || true
   if ! match_route "$request_path"; then
-    status=$(serve_filesystem_fallback "$response_tmp" "$request_method" "$request_path" "$normalized_segs")
+    status=$(serve_filesystem_fallback "$response_tmp" "$request_method" "$request_path" "$normalized_segs" "$request_body_file" "$request_target" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds")
   else
     local chosen_method="$request_method"
     if ! find_handler_for_method "$MATCH_ROUTE" "$chosen_method"; then
@@ -664,30 +749,7 @@ handle_request() {
     if [[ "$MATCH_KIND" == 'static' ]]; then
       status=$(serve_static "$response_tmp" "$request_method" "$MATCH_HANDLER")
     else
-      run_handler "$MATCH_HANDLER" "$request_body_file" "$request_method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
-      if (( HANDLER_EXIT_CODE == 142 || HANDLER_EXIT_CODE == 124 )); then
-        write_json_response_file "$response_tmp" "$request_method" 504 "{\"error\":\"handler_timeout\",\"timeout_seconds\":$timeout_seconds}"
-        status='504'
-      elif (( HANDLER_EXIT_CODE == 127 )); then
-        write_json_response_file "$response_tmp" "$request_method" 502 '{"error":"exec_failed","message":"exec_failed"}'
-        status='502'
-      else
-        local raw_for_parse
-        raw_for_parse="$HANDLER_STDOUT_FILE"
-        if [[ ! -s "$raw_for_parse" && "$HANDLER_EXIT_CODE" != '0' && -s "$HANDLER_STDERR_FILE" ]]; then
-          raw_for_parse="$HANDLER_STDERR_FILE"
-        fi
-        parse_cgi_response "$raw_for_parse" "$(exit_to_status "$HANDLER_EXIT_CODE")"
-        write_response_file "$response_tmp" "$request_method" "$CGI_STATUS" "$CGI_CONTENT_TYPE" "$CGI_BODY_FILE" "$CGI_HEADERS_FILE"
-        status="$CGI_STATUS"
-        rm -f "$CGI_BODY_FILE" "$CGI_HEADERS_FILE"
-      fi
-      if [[ -s "$HANDLER_STDERR_FILE" ]]; then
-        local stderr_text
-        stderr_text=$(tr -d '\r' < "$HANDLER_STDERR_FILE" | tr '\n' ' ')
-        printf '  [handler stderr] %s\n' "$stderr_text" >&2
-      fi
-      rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+      status=$(serve_executable_fallback "$response_tmp" "$MATCH_HANDLER" "$request_body_file" "$request_method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds")
     fi
   fi
   log_result "$request_method" "$request_path" "$status" "$started"

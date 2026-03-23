@@ -625,19 +625,46 @@ local function serve_dir_listing(client, method, dir_path, request_path)
   return 200
 end
 
-local function serve_filesystem_fallback(client, method, segs, route_dir, request_path)
+local handle_handler
+
+local function find_directory_index(dir_path)
+  for _, name in ipairs({ "index.html", "index.htm" }) do
+    local candidate = dir_path .. "/" .. name
+    if is_file(candidate) then
+      return "static", candidate
+    end
+  end
+
+  local entries = list_dir_entries(dir_path)
+  for _, name in ipairs(entries) do
+    local candidate = dir_path .. "/" .. name
+    if name:match("^index%.") and is_file(candidate) and is_executable(candidate) then
+      return "exec", candidate
+    end
+  end
+  return nil, nil
+end
+
+local function serve_filesystem_fallback(client, request, segs, route_dir, timeout_seconds, listen_addr)
   local parts = { route_dir }
   for _, seg in ipairs(segs) do
     parts[#parts + 1] = seg
   end
   local fallback = table.concat(parts, "/")
   if is_dir(fallback) then
-    return serve_dir_listing(client, method, fallback, request_path)
+    local kind, candidate = find_directory_index(fallback)
+    if kind == "static" then
+      return serve_static(client, request.method, candidate)
+    end
+    if kind == "exec" then
+      return handle_handler(client, request, candidate, {}, timeout_seconds, listen_addr)
+    end
+    return serve_dir_listing(client, request.method, fallback, request.path)
   end
   if is_file(fallback) then
-    return serve_static(client, method, fallback)
+    return serve_static(client, request.method, fallback)
   end
-  return write_json(client, method, 404, { error = "not_found", path = request_path })
+  return write_json(client, request.method, 404, { error = "not_found", path = request.path })
 end
 
 local function parse_request(client)
@@ -687,7 +714,7 @@ local function log_result(method, path, status, start_time)
   io.stderr:flush()
 end
 
-local function handle_handler(client, request, handler_path, params, timeout_seconds, listen_addr)
+handle_handler = function(client, request, handler_path, params, timeout_seconds, listen_addr)
   if not is_executable(handler_path) then
     return serve_static(client, request.method, handler_path)
   end
@@ -768,7 +795,7 @@ local function main()
           local segs = normalize_request_path(request.path)
           local node, params = match_node(root, segs)
           if not node or next(node.handlers) == nil then
-            status = serve_filesystem_fallback(client, request.method, segs, abs_route_dir, request.path)
+            status = serve_filesystem_fallback(client, request, segs, abs_route_dir, timeout_seconds, listen_addr)
             return
           end
           local handler_path = node.handlers[request.method]

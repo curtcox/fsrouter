@@ -235,6 +235,13 @@ func (s *server) serveFilesystem(w http.ResponseWriter, r *http.Request, segs []
 		http.ServeFile(w, r, fullPath)
 		return 200
 	}
+	if kind, indexPath, ok := findDirectoryIndex(fullPath); ok {
+		if kind == "static" {
+			http.ServeFile(w, r, indexPath)
+			return 200
+		}
+		return s.handle(w, r, indexPath, map[string]string{})
+	}
 	return s.serveDirListing(w, r, fullPath)
 }
 
@@ -484,6 +491,30 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func findDirectoryIndex(dirPath string) (kind string, path string, ok bool) {
+	for _, name := range []string{"index.html", "index.htm"} {
+		candidate := filepath.Join(dirPath, name)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return "static", candidate, true
+		}
+	}
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return "", "", false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "index.") {
+			continue
+		}
+		candidate := filepath.Join(dirPath, name)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Mode()&0111 != 0 {
+			return "exec", candidate, true
+		}
+	}
+	return "", "", false
 }
 
 // envKey converts a parameter or query name to a valid env var suffix:

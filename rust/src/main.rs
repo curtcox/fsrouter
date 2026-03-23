@@ -143,14 +143,14 @@ async fn handle_request(
     let (node, params) = match state.root.match_segments(&segs) {
         Some(result) => result,
         None => {
-            let response = serve_filesystem(&state.route_dir, &segs, &raw_path, method.as_str()).await;
+            let response = serve_filesystem(&state, &parts, &body, remote_addr, &segs, &raw_path).await;
             log_request(method.as_str(), &raw_path, response.status(), start.elapsed());
             return response;
         }
     };
 
     if node.handlers.is_empty() {
-        let response = serve_filesystem(&state.route_dir, &segs, &raw_path, method.as_str()).await;
+        let response = serve_filesystem(&state, &parts, &body, remote_addr, &segs, &raw_path).await;
         log_request(method.as_str(), &raw_path, response.status(), start.elapsed());
         return response;
     }
@@ -668,13 +668,61 @@ fn join_prefix(prefix: &str, segment: &str) -> String {
     }
 }
 
-async fn serve_filesystem(route_dir: &Path, segs: &[String], raw_path: &str, method: &str) -> Response<Body> {
+async fn serve_filesystem(
+    state: &AppState,
+    parts: &Parts,
+    body: &Bytes,
+    remote_addr: SocketAddr,
+    segs: &[String],
+    raw_path: &str,
+) -> Response<Body> {
+    let route_dir = &state.route_dir;
     let full_path: PathBuf = segs.iter().fold(route_dir.to_path_buf(), |acc, s| acc.join(s));
     match tokio::fs::metadata(&full_path).await {
         Err(_) => json_response(StatusCode::NOT_FOUND, json!({"error":"not_found","path":raw_path})),
-        Ok(meta) if meta.is_file() => serve_static(&full_path, method == "HEAD").await,
-        Ok(_) => serve_dir_listing(&full_path, raw_path, method == "HEAD").await,
+        Ok(meta) if meta.is_file() => serve_static(&full_path, parts.method == Method::HEAD).await,
+        Ok(_) => {
+            if let Some((kind, path)) = find_directory_index(&full_path).await {
+                if kind == "static" {
+                    serve_static(&path, parts.method == Method::HEAD).await
+                } else {
+                    let params = BTreeMap::new();
+                    handle_handler(state, parts, body, remote_addr, &path, &params).await
+                }
+            } else {
+                serve_dir_listing(&full_path, raw_path, parts.method == Method::HEAD).await
+            }
+        }
     }
+}
+
+async fn find_directory_index(dir_path: &Path) -> Option<(&'static str, PathBuf)> {
+    for name in ["index.html", "index.htm"] {
+        let candidate = dir_path.join(name);
+        if let Ok(metadata) = tokio::fs::metadata(&candidate).await {
+            if metadata.is_file() {
+                return Some(("static", candidate));
+            }
+        }
+    }
+
+    let mut rd = tokio::fs::read_dir(dir_path).await.ok()?;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("index.") {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(metadata) = entry.metadata().await {
+            if metadata.is_file() && is_executable(&metadata) {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.into_iter().next().map(|path| ("exec", path))
 }
 
 async fn serve_dir_listing(dir_path: &Path, request_path: &str, suppress_body: bool) -> Response<Body> {

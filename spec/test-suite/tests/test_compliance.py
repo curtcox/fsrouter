@@ -473,6 +473,56 @@ printf '{\"done\":true}'"""))
                 self.assertIn("text/html", headers.get_content_type())
                 self.assertIn(b"readme.txt", body)
 
+    def test_directory_prefers_index_html_over_listing(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            docs = routes / "docs"
+            docs.mkdir()
+            (docs / "index.html").write_text("<h1>docs home</h1>", encoding="utf-8")
+            (docs / "readme.txt").write_text("doc content", encoding="utf-8")
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, headers, body = server.request("GET", "/docs")
+                self.assertEqual(status, 200)
+                self.assertIn("text/html", headers.get_content_type())
+                self.assertEqual(body.decode("utf-8"), "<h1>docs home</h1>")
+
+    def test_directory_prefers_html_index_over_executable_index(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            docs = routes / "docs"
+            docs.mkdir()
+            (docs / "index.html").write_text("<h1>static index</h1>", encoding="utf-8")
+            self.write_handler(routes, "docs/index.sh", self.shell("""printf '{"source":"exec"}'"""))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, headers, body = server.request("GET", "/docs")
+                self.assertEqual(status, 200)
+                self.assertIn("text/html", headers.get_content_type())
+                self.assertEqual(body.decode("utf-8"), "<h1>static index</h1>")
+
+    def test_directory_executes_executable_index_file(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            docs = routes / "docs"
+            docs.mkdir()
+            self.write_handler(routes, "docs/index.sh", self.shell("""printf '{"source":"exec"}'"""))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, headers, body = server.request("GET", "/docs")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get_content_type(), "application/json")
+                self.assertEqual(self.parse_json(body), {"source": "exec"})
+
+    def test_directory_executable_index_runs_in_its_directory(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            docs = routes / "docs"
+            docs.mkdir()
+            (docs / "value.txt").write_text("from-index-dir", encoding="utf-8")
+            self.write_handler(routes, "docs/index.sh", self.shell("""cat value.txt"""))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, _, body = server.request("GET", "/docs")
+                self.assertEqual(status, 200)
+                self.assertEqual(body.decode("utf-8"), "from-index-dir")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

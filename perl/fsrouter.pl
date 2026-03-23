@@ -528,17 +528,38 @@ sub serve_dir_listing {
     return 200;
 }
 
+sub find_directory_index {
+    my ($dir_path) = @_;
+    for my $name ('index.html', 'index.htm') {
+        my $candidate = File::Spec->catfile($dir_path, $name);
+        return ('static', $candidate) if -f $candidate;
+    }
+
+    opendir(my $dh, $dir_path) or return;
+    my @entries = sort grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
+    for my $name (@entries) {
+        next if $name !~ /^index\./;
+        my $candidate = File::Spec->catfile($dir_path, $name);
+        return ('exec', $candidate) if -f $candidate && is_executable($candidate);
+    }
+    return;
+}
+
 sub serve_filesystem_fallback {
-    my ($client, $method, $segs, $abs_route_dir, $request_path) = @_;
+    my ($client, $request, $segs, $abs_route_dir, $timeout_seconds, $listen_addr) = @_;
     my $fallback = File::Spec->catfile($abs_route_dir, @{$segs});
     $fallback = $abs_route_dir if !@{$segs};
     if (-d $fallback) {
-        return serve_dir_listing($client, $method, $fallback, $request_path);
+        my ($kind, $candidate) = find_directory_index($fallback);
+        return serve_static($client, $request->{method}, $candidate) if defined($kind) && $kind eq 'static';
+        return handle_handler($client, $request, $candidate, {}, $timeout_seconds, $listen_addr) if defined($kind) && $kind eq 'exec';
+        return serve_dir_listing($client, $request->{method}, $fallback, $request->{path});
     }
     if (-f $fallback) {
-        return serve_static($client, $method, $fallback);
+        return serve_static($client, $request->{method}, $fallback);
     }
-    return write_json($client, $method, 404, { error => 'not_found', path => $request_path });
+    return write_json($client, $request->{method}, 404, { error => 'not_found', path => $request->{path} });
 }
 
 sub parse_request {
@@ -688,7 +709,7 @@ sub main {
             my $segs = normalize_request_path($request->{path});
             my ($node, $params) = match_node($root, $segs);
             if (!defined $node || !keys %{ $node->{handlers} }) {
-                $status = serve_filesystem_fallback($client, $request->{method}, $segs, $abs_route_dir, $request->{path});
+                $status = serve_filesystem_fallback($client, $request, $segs, $abs_route_dir, $timeout_seconds, $listen_addr);
                 1;
             } else {
                 my $handler_path = $node->{handlers}{ $request->{method} };

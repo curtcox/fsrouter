@@ -22,6 +22,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -130,7 +131,7 @@ public class FSRouter {
                 List<String> segs = normalizeRequestPath(rawPath);
                 MatchResult match = root.match(segs);
                 if (match.node() == null || match.node().handlers.isEmpty()) {
-                    status = serveFilesystem(exchange, method, routeDir, segs, rawPath);
+                    status = serveFilesystem(exchange, method, routeDir, segs, rawPath, timeoutSeconds, listenAddr);
                     logResult(method, rawPath, status, start);
                     return;
                 }
@@ -156,7 +157,7 @@ public class FSRouter {
         }
     }
 
-    private static int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<String> segs, String rawPath) throws IOException {
+    private static int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<String> segs, String rawPath, int timeoutSeconds, String listenAddr) throws IOException {
         Path fallback = routeDir;
         for (String seg : segs) {
             fallback = fallback.resolve(seg);
@@ -168,9 +169,45 @@ public class FSRouter {
             return serveStatic(exchange, method, fallback);
         }
         if (Files.isDirectory(fallback)) {
+            DirectoryIndex preferred = findDirectoryIndex(fallback);
+            if (preferred != null) {
+                if (preferred.kind.equals("static")) {
+                    return serveStatic(exchange, method, preferred.path);
+                }
+                return handleHandler(exchange, method, preferred.path, Map.of(), timeoutSeconds, listenAddr);
+            }
             return serveDirListing(exchange, method, fallback, rawPath);
         }
         return writeJson(exchange, method, 404, jsonObject(Map.of("error", "not_found", "path", rawPath)));
+    }
+
+    private record DirectoryIndex(String kind, Path path) {}
+
+    private static DirectoryIndex findDirectoryIndex(Path dirPath) {
+        for (String name : List.of("index.html", "index.htm")) {
+            Path candidate = dirPath.resolve(name);
+            if (Files.isRegularFile(candidate)) {
+                return new DirectoryIndex("static", candidate);
+            }
+        }
+        try (var stream = Files.list(dirPath)) {
+            return stream
+                .filter(Files::isRegularFile)
+                .filter(path -> path.getFileName().toString().startsWith("index."))
+                .sorted(Comparator.comparing(path -> path.getFileName().toString()))
+                .filter(path -> {
+                    try {
+                        return isExecutable(path);
+                    } catch (IOException e) {
+                        return false;
+                    }
+                })
+                .findFirst()
+                .map(path -> new DirectoryIndex("exec", path))
+                .orElse(null);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     private static int serveDirListing(HttpExchange exchange, String method, Path dirPath, String requestPath) throws IOException {

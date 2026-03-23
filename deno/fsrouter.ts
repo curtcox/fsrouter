@@ -445,7 +445,7 @@ async function serveStatic(handlerPath: string, request: Request): Promise<Respo
   try {
     const body = await Deno.readFile(handlerPath);
     const headers = new Headers();
-    headers.set("content-type", "application/octet-stream");
+    headers.set("content-type", mimeTypeFor(handlerPath));
     headers.set("content-length", String(body.length));
     return new Response(request.method === "HEAD" ? null : responseBody(body), { status: 200, headers });
   } catch (error) {
@@ -474,26 +474,63 @@ function logResult(request: Request, status: number, start: number): void {
   console.error(`${request.method} ${url.pathname} → ${status} (${elapsed.toFixed(6)}s)`);
 }
 
-async function serveFilesystem(routeDir: string, segs: string[], requestPath: string, method: string): Promise<Response> {
+async function serveFilesystem(
+  routeDir: string,
+  segs: string[],
+  requestPath: string,
+  request: Request,
+  timeoutSeconds: number,
+  listenAddr: string,
+  remoteAddr: Deno.NetAddr | null,
+): Promise<Response> {
   const fullPath = segs.length === 0 ? routeDir : [routeDir, ...segs].join("/");
   let info: Deno.FileInfo;
   try {
     info = await Deno.stat(fullPath);
   } catch {
-    return jsonResponse(404, { error: "not_found", path: requestPath }, method);
+    return jsonResponse(404, { error: "not_found", path: requestPath }, request.method);
   }
   if (!info.isDirectory) {
+    return serveStatic(fullPath, request);
+  }
+  const preferred = await findDirectoryIndex(fullPath);
+  if (preferred) {
+    if (preferred.kind === "static") {
+      return serveStatic(preferred.path, request);
+    }
+    return executeHandler(preferred.path, request, {}, timeoutSeconds, remoteAddr, listenAddr);
+  }
+  return serveDirListing(fullPath, requestPath, request.method);
+}
+
+async function findDirectoryIndex(dirPath: string): Promise<{ kind: "static" | "exec"; path: string } | null> {
+  for (const name of ["index.html", "index.htm"]) {
+    const candidate = joinFsPath(dirPath, name);
     try {
-      const body = await Deno.readFile(fullPath);
-      const headers = new Headers();
-      headers.set("content-type", mimeTypeFor(fullPath));
-      headers.set("content-length", String(body.length));
-      return new Response(method === "HEAD" ? null : responseBody(body), { status: 200, headers });
-    } catch (error) {
-      return jsonResponse(500, { error: "static_read_failed", message: error instanceof Error ? error.message : String(error) }, method);
+      const info = await Deno.stat(candidate);
+      if (info.isFile) {
+        return { kind: "static", path: candidate };
+      }
+    } catch {
     }
   }
-  return serveDirListing(fullPath, requestPath, method);
+
+  const executableIndexes: string[] = [];
+  try {
+    for await (const entry of Deno.readDir(dirPath)) {
+      if (!entry.isFile || !entry.name.startsWith("index.")) {
+        continue;
+      }
+      const candidate = joinFsPath(dirPath, entry.name);
+      if (await isExecutable(candidate)) {
+        executableIndexes.push(candidate);
+      }
+    }
+  } catch {
+    return null;
+  }
+  executableIndexes.sort((a, b) => a.localeCompare(b));
+  return executableIndexes.length > 0 ? { kind: "exec", path: executableIndexes[0] } : null;
 }
 
 async function serveDirListing(dirPath: string, requestPath: string, method: string): Promise<Response> {
@@ -535,7 +572,7 @@ async function handleRequest(request: Request, root: Node, timeoutSeconds: numbe
     const segs = normalizeRequestPath(url.pathname);
     const match = root.match(segs);
     if (!match.node || match.node.handlers.size === 0) {
-      response = await serveFilesystem(routeDir, segs, url.pathname, request.method);
+      response = await serveFilesystem(routeDir, segs, url.pathname, request, timeoutSeconds, listenAddr, remoteAddr);
       logResult(request, response.status, start);
       return response;
     }

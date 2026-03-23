@@ -338,15 +338,35 @@ rescue StandardError => e
   500
 end
 
-def serve_filesystem_fallback(req, res, segs, route_dir_abs)
+def serve_filesystem_fallback(req, res, segs, route_dir_abs, server_config)
   fallback = File.join(route_dir_abs, *segs)
   if File.file?(fallback)
     return serve_static(req, res, fallback)
   elsif File.directory?(fallback)
+    preferred = find_directory_index(fallback)
+    if preferred
+      kind, path = preferred
+      return kind == :static ? serve_static(req, res, path) : handle_handler(req, res, server_config, path, {})
+    end
     return serve_dir_listing(req, res, fallback, req.path)
   end
   json_response(res, req, 404, { error: 'not_found', path: req.path })
   404
+end
+
+def find_directory_index(dir_path)
+  %w[index.html index.htm].each do |name|
+    path = File.join(dir_path, name)
+    return [:static, path] if File.file?(path)
+  end
+  executable = Dir.children(dir_path)
+                  .select { |name| name.start_with?('index.') }
+                  .sort
+                  .map { |name| File.join(dir_path, name) }
+                  .find { |path| File.file?(path) && is_executable(path) }
+  executable ? [:exec, executable] : nil
+rescue StandardError
+  nil
 end
 
 def serve_dir_listing(req, res, dir_path, request_path)
@@ -402,7 +422,7 @@ def process_request(req, res, root, server_config)
     segs = normalize_request_path(req.path)
     node, params = root.match(segs)
     if node.nil? || node.handlers.empty?
-      status = serve_filesystem_fallback(req, res, segs, server_config[:route_dir_abs])
+      status = serve_filesystem_fallback(req, res, segs, server_config[:route_dir_abs], server_config)
     else
       handler_path = node.handlers[req.request_method]
       handler_path ||= node.handlers['GET'] if req.request_method == 'HEAD'

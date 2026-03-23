@@ -441,7 +441,7 @@ int writeCgiResponse(HttpExchange exchange, String method, byte[] raw, int exitC
     status
 }
 
-int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<String> segs, String rawPath) {
+int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<String> segs, String rawPath, int timeoutSeconds, String listenAddr) {
     Path fallback = routeDir
     for (String seg : segs) {
         fallback = fallback.resolve(seg)
@@ -453,9 +453,43 @@ int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<St
         return serveStatic(exchange, method, fallback)
     }
     if (Files.isDirectory(fallback)) {
+        Map preferred = findDirectoryIndex(fallback)
+        if (preferred != null) {
+            if (preferred.kind == 'static') {
+                return serveStatic(exchange, method, preferred.path as Path)
+            }
+            return handleHandler(exchange, method, preferred.path as Path, [:], timeoutSeconds, listenAddr)
+        }
         return serveDirListing(exchange, method, fallback, rawPath)
     }
     return writeJson(exchange, method, 404, [error: 'not_found', path: rawPath])
+}
+
+Map findDirectoryIndex(Path dirPath) {
+    for (String name : ['index.html', 'index.htm']) {
+        Path candidate = dirPath.resolve(name)
+        if (Files.isRegularFile(candidate)) {
+            return [kind: 'static', path: candidate]
+        }
+    }
+    try {
+        return Files.list(dirPath)
+            .filter { Files.isRegularFile(it) }
+            .filter { it.fileName.toString().startsWith('index.') }
+            .sorted { a, b -> a.fileName.toString() <=> b.fileName.toString() }
+            .filter {
+                try {
+                    isExecutable(it)
+                } catch (IOException ignored) {
+                    false
+                }
+            }
+            .findFirst()
+            .map { [kind: 'exec', path: it] }
+            .orElse(null)
+    } catch (IOException ignored) {
+        return null
+    }
 }
 
 int serveDirListing(HttpExchange exchange, String method, Path dirPath, String requestPath) {
@@ -609,7 +643,7 @@ class RouterHandler implements HttpHandler {
             Node node = (Node) match.node
             Map<String, String> params = (Map<String, String>) (match.params ?: [:])
             if (node == null || node.handlers.isEmpty()) {
-                status = support.serveFilesystem(exchange, method, routeDir, segs, rawPath)
+                status = support.serveFilesystem(exchange, method, routeDir, segs, rawPath, timeoutSeconds, listenAddr)
                 support.logResult(method, rawPath, status, start)
                 return
             }

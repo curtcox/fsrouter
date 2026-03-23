@@ -158,9 +158,33 @@ class Handler(BaseHTTPRequestHandler):
         if fallback.is_file():
             return self.serve_static(fallback)
         if fallback.is_dir():
+            preferred = self.find_directory_index(fallback)
+            if preferred is not None:
+                kind, path = preferred
+                if kind == "static":
+                    return self.serve_static(path)
+                return self.handle_handler(path, {})
             return self.serve_dir_listing(fallback, request_path)
         self.write_json(404, {"error": "not_found", "path": request_path})
         return 404
+
+    def find_directory_index(self, dir_path: Path) -> Optional[tuple[str, Path]]:
+        for name in ("index.html", "index.htm"):
+            path = dir_path / name
+            if path.is_file():
+                return ("static", path)
+        executable_indexes: list[Path] = []
+        try:
+            for entry in dir_path.iterdir():
+                if not entry.is_file() or not entry.name.startswith("index."):
+                    continue
+                if is_executable(entry.stat()):
+                    executable_indexes.append(entry)
+        except OSError:
+            return None
+        if executable_indexes:
+            return ("exec", sorted(executable_indexes, key=lambda p: p.name)[0])
+        return None
 
     def serve_dir_listing(self, dir_path: Path, request_path: str) -> int:
         try:

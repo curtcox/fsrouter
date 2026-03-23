@@ -140,10 +140,19 @@ serve the path directly from the filesystem before returning 404.
    - `Content-Type`: detected from the file extension (same logic as §5.2).
    - Body: the raw file contents.
 3. **Directory** — if the candidate path is a directory:
-   - Status: `200 OK`
-   - `Content-Type: text/html; charset=utf-8`
-   - Body: a simple HTML directory listing with hyperlinks to each entry.
-     Subdirectories are shown with a trailing `/`.
+   1. If `index.html` exists and is a regular file, serve that file exactly as
+      in step 2.
+   2. Otherwise, if `index.htm` exists and is a regular file, serve that file
+      exactly as in step 2.
+   3. Otherwise, if one or more regular files whose names match `index.*` are
+      present and executable, execute the lexicographically first such file
+      using the executable handler contract from §5.3. The subprocess working
+      directory is still the executable's parent directory (§5.3.2).
+   4. Otherwise return a directory listing:
+      - Status: `200 OK`
+      - `Content-Type: text/html; charset=utf-8`
+      - Body: a simple HTML directory listing with hyperlinks to each entry.
+        Subdirectories are shown with a trailing `/`.
 4. **Not found** — otherwise return **404 Not Found** (§8.1).
 
 The filesystem fallback is intentionally a last resort. Handler routes always
@@ -526,3 +535,7 @@ tests. Each test corresponds to an entry in `spec/test-suite/tests/`.
 | 20 | Hyphens in param/query names become underscores | §7.2.2, §7.2.3 |
 | 21 | Arbitrary file at ROUTE_DIR/<path> is served directly (§4.4 fallback) | §4.4 |
 | 22 | Directory at ROUTE_DIR/<path> returns HTML listing (§4.4 fallback) | §4.4 |
+| 23 | Directory fallback prefers `index.html` over listing | §4.4 |
+| 24 | HTML directory index wins over executable `index.*` | §4.4 |
+| 25 | Executable `index.*` is run when no HTML index exists | §4.4, §5.3 |
+| 26 | Executable `index.*` runs with its parent directory as cwd | §4.4, §5.3.2 |
