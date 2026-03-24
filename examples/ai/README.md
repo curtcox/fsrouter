@@ -4,16 +4,19 @@ This example is a filesystem-routed web app that accepts change requests and
 uses OpenRouter to:
 
 1. Check whether the requested change is already satisfied.
-2. Gather filesystem context as file references with line ranges.
-3. Show the captured context with links back to the underlying files.
-4. Ask an AI model to plan and generate the change.
-5. Decompose the work recursively when the model says the change is safer in
+2. Generate a validation command from the request, enforce a strict command
+   allowlist, risk-score it, and require the preflight check to fail before any
+   edits are attempted.
+3. Gather filesystem context as file references with line ranges.
+4. Show the captured context with links back to the underlying files.
+5. Ask an AI model to plan and generate the change.
+6. Decompose the work recursively when the model says the change is safer in
    smaller parts.
-6. Review the generated edits before applying them.
-7. Apply the changes to the filesystem.
-8. Re-run the supplied validation command.
-9. Show a linked list of the resulting diffs.
-10. Suggest likely follow-up requests with prefilled links back to the form.
+7. Review the generated edits before applying them.
+8. Apply the changes to the filesystem.
+9. Re-run the generated validation command.
+10. Show a linked list of the resulting diffs.
+11. Suggest likely follow-up requests with prefilled links back to the form.
 
 It also includes a gallery of starter change requests so users can browse
 examples, learn what kinds of changes the app can make, and prefill the form
@@ -35,7 +38,8 @@ Then open [http://localhost:8080](http://localhost:8080).
 - `AI_CHANGE_ROOT`
   - Filesystem root to inspect and edit. Defaults to the repository root.
 - `AI_CHANGE_COMMAND_TIMEOUT`
-  - Timeout for the user-supplied validation command. Defaults to `120`.
+  - Timeout for generated validation commands before/after edits. Defaults to
+    `120`.
 - `OPENROUTER_HTTP_REFERER`
   - Optional referer header for OpenRouter requests.
 
@@ -44,6 +48,9 @@ Then open [http://localhost:8080](http://localhost:8080).
 - Runtime state is written under `examples/ai/data/`.
 - Prompt templates live in `examples/ai/prompts/` as plain text files so they
   can be diffed and versioned independently.
+- Validation command generation uses up to three AI attempts, each attempt
+  consumes budget, and each candidate must pass allowlist and risk checks
+  before preflight execution.
 - Starter gallery prompts live in `examples/ai/starter-prompts/` as individual
   plain text files.
 - The starter gallery includes simple and advanced examples across CLI, HTML,

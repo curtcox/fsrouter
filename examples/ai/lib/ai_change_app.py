@@ -6,6 +6,8 @@ import hashlib
 import html
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,11 +32,36 @@ MAX_CONTEXT_CHARS = 14000
 MAX_MANIFEST_ITEMS = 2000
 MAX_CHANGE_FILES = 20
 MAX_RECURSION_DEPTH = 2
+MAX_VALIDATION_COMMAND_ATTEMPTS = 3
+MAX_VALIDATION_RISK_SCORE = 2.0
 MODEL_FETCH_TIMEOUT = 8
 CHAT_TIMEOUT = 60
 REFRESH_SECONDS = 3
 PROTECTED_PATH_PARTS = {".git"}
 PROTECTED_RELATIVE_PREFIXES = {"examples/ai/data/"}
+ALLOWED_VALIDATION_COMMANDS = (
+    ("pytest",),
+    ("go", "test"),
+    ("cargo", "test"),
+    ("deno", "test"),
+    ("npm", "test"),
+    ("npm", "run", "test"),
+    ("npm", "run", "build"),
+    ("pnpm", "test"),
+    ("pnpm", "run", "test"),
+    ("pnpm", "run", "build"),
+    ("yarn", "test"),
+    ("yarn", "run", "test"),
+    ("yarn", "run", "build"),
+    ("python", "-m", "pytest"),
+    ("python3", "-m", "pytest"),
+    ("python", "-m", "unittest"),
+    ("python3", "-m", "unittest"),
+    ("python", "-m", "py_compile"),
+    ("python3", "-m", "py_compile"),
+    ("python", "spec/test-suite/run.py"),
+    ("python3", "spec/test-suite/run.py"),
+)
 
 
 class AppError(Exception):
@@ -201,7 +228,6 @@ def models_cache_path() -> Path:
 
 def default_preferences() -> dict:
     return {
-        "default_validation_command": "",
         "favorite_models": [],
         "last_budget": DEFAULT_AI_BUDGET,
         "last_model": "",
@@ -222,7 +248,6 @@ def load_preferences() -> dict:
         merged["last_budget"] = max(1, int(merged.get("last_budget", DEFAULT_AI_BUDGET)))
     except (TypeError, ValueError):
         merged["last_budget"] = DEFAULT_AI_BUDGET
-    merged["default_validation_command"] = str(merged.get("default_validation_command", "")).strip()
     merged["last_model"] = str(merged.get("last_model", "")).strip()
     return merged
 
@@ -248,12 +273,6 @@ def update_favorite_model(model: str, action: str) -> None:
     if action == "remove":
         favorites = [item for item in favorites if item != model]
     prefs["favorite_models"] = favorites
-    save_preferences(prefs)
-
-
-def save_settings_preferences(default_validation_command: str) -> None:
-    prefs = load_preferences()
-    prefs["default_validation_command"] = default_validation_command.strip()
     save_preferences(prefs)
 
 
@@ -530,6 +549,47 @@ def run_check_command(command: str, *, timeout_override: int | None = None) -> C
     )
 
 
+def _validation_command_segments(command: str) -> list[str]:
+    candidate = command.strip()
+    if not candidate:
+        raise AppError("Generated validation command was empty.")
+    if any(fragment in candidate for fragment in ("|", "||", ";", ">", "<", "`", "$(", "\n", "\r")):
+        raise AppError("Generated validation command used blocked shell syntax.")
+    return [segment.strip() for segment in candidate.split("&&") if segment.strip()]
+
+
+def _tokens_match_prefix(tokens: list[str], prefix: tuple[str, ...]) -> bool:
+    return len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix
+
+
+def _is_allowed_validation_tokens(tokens: list[str]) -> bool:
+    for prefix in ALLOWED_VALIDATION_COMMANDS:
+        if _tokens_match_prefix(tokens, prefix):
+            return True
+    return False
+
+
+def validation_command_allowlist_issue(command: str) -> str | None:
+    try:
+        segments = _validation_command_segments(command)
+    except AppError as err:
+        return str(err)
+    if not segments:
+        return "Generated validation command did not include a runnable segment."
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError as err:
+            return f"Could not parse validation command segment: {err}"
+        if not tokens:
+            return "Generated validation command contained an empty segment."
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+            return "Environment variable assignments are not allowed in generated validation commands."
+        if not _is_allowed_validation_tokens(tokens):
+            return f"Segment is outside the strict validation allowlist: {segment}"
+    return None
+
+
 def change_dir(change_id: str) -> Path:
     return CHANGES_ROOT / change_id
 
@@ -577,6 +637,10 @@ def save_result(change_id: str, result: dict) -> None:
     write_json_atomic(result_path_for(change_id), result)
 
 
+def save_request(change_id: str, request: dict) -> None:
+    write_json_atomic(request_path_for(change_id), request)
+
+
 def append_event(change_id: str, message: str, *, level: str = "info") -> None:
     append_jsonl(
         events_path_for(change_id),
@@ -599,7 +663,7 @@ def load_events(change_id: str) -> list[dict]:
     return items
 
 
-def create_change_request(description: str, validation_command: str, model: str, ai_budget: int, favorite_model: bool) -> str:
+def create_change_request(description: str, model: str, ai_budget: int, favorite_model: bool) -> str:
     ensure_runtime_dirs()
     change_id = f"{now_slug()}-{uuid.uuid4().hex[:6]}"
     directory = change_dir(change_id)
@@ -607,7 +671,8 @@ def create_change_request(description: str, validation_command: str, model: str,
     request = {
         "id": change_id,
         "description": description,
-        "validation_command": validation_command,
+        "validation_command": "",
+        "validation_command_source": "auto_generated",
         "model": model,
         "ai_budget": ai_budget,
         "favorite_model": favorite_model,
@@ -690,6 +755,9 @@ class Workflow:
         save_state(self.change_id, self.state)
         save_result(self.change_id, self.result)
 
+    def persist_request(self) -> None:
+        save_request(self.change_id, self.request)
+
     def log(self, message: str, *, level: str = "info") -> None:
         append_event(self.change_id, message, level=level)
 
@@ -728,6 +796,135 @@ class Workflow:
             },
         )
         return extract_json(raw_response)
+
+    def _validation_generation_rejections(self, attempts: list[dict]) -> str:
+        lines: list[str] = []
+        for item in attempts:
+            reason = str(item.get("rejection_reason", "")).strip()
+            if not reason:
+                continue
+            command = str(item.get("candidate_command", "")).strip() or "(empty command)"
+            lines.append(f"- Attempt {item.get('attempt')}: {command} -> {reason}")
+        return "\n".join(lines) if lines else "(none)"
+
+    def _score_validation_command_risk(self, command: str, generation_reason: str, attempt: int, attempts: list[dict]) -> tuple[float, str, list[str]]:
+        payload = self.ai_json(
+            "validation_risk",
+            {
+                "CHANGE_DESCRIPTION": self.request["description"],
+                "VALIDATION_COMMAND": command,
+                "GENERATION_REASON": generation_reason or "(none provided)",
+                "SERVER_ROOT": str(target_root()),
+                "ATTEMPT_NUMBER": str(attempt),
+                "MAX_ATTEMPTS": str(MAX_VALIDATION_COMMAND_ATTEMPTS),
+                "PREVIOUS_REJECTIONS": self._validation_generation_rejections(attempts),
+                "AI_CALLS_REMAINING": str(self.remaining_budget()),
+            },
+        )
+        raw_score = payload.get("risk_score", payload.get("score"))
+        if isinstance(raw_score, str):
+            raw_score = raw_score.strip()
+        try:
+            risk_score = float(raw_score)
+        except (TypeError, ValueError) as err:
+            raise AppError("Validation risk scoring did not return a numeric score.") from err
+        if risk_score < 0 or risk_score > 10:
+            raise AppError(f"Validation risk score must be between 0 and 10, got {risk_score}.")
+        summary = str(payload.get("summary", payload.get("reason", ""))).strip()
+        concerns_raw = payload.get("concerns", [])
+        concerns: list[str] = []
+        if isinstance(concerns_raw, list):
+            for item in concerns_raw[:8]:
+                text = str(item).strip()
+                if text:
+                    concerns.append(text)
+        return risk_score, summary, concerns
+
+    def generate_validation_command(self) -> CommandResult:
+        generation = {
+            "max_attempts": MAX_VALIDATION_COMMAND_ATTEMPTS,
+            "risk_threshold": MAX_VALIDATION_RISK_SCORE,
+            "attempts": [],
+        }
+        self.result["validation_command_generation"] = generation
+        self.persist()
+
+        manifest = build_file_manifest()
+        attempts = generation["attempts"]
+        for attempt in range(1, MAX_VALIDATION_COMMAND_ATTEMPTS + 1):
+            payload = self.ai_json(
+                "validation_command",
+                {
+                    "CHANGE_DESCRIPTION": self.request["description"],
+                    "SERVER_ROOT": str(target_root()),
+                    "FILE_MANIFEST": manifest,
+                    "ATTEMPT_NUMBER": str(attempt),
+                    "MAX_ATTEMPTS": str(MAX_VALIDATION_COMMAND_ATTEMPTS),
+                    "PREVIOUS_REJECTIONS": self._validation_generation_rejections(attempts),
+                    "AI_CALLS_REMAINING": str(self.remaining_budget()),
+                },
+            )
+            command = str(payload.get("command", "")).strip()
+            generator_reason = str(payload.get("reason", payload.get("summary", ""))).strip()
+            attempt_record: dict = {
+                "attempt": attempt,
+                "candidate_command": command,
+                "generator_reason": generator_reason,
+            }
+            issue = validation_command_allowlist_issue(command)
+            if issue:
+                attempt_record["accepted"] = False
+                attempt_record["rejection_reason"] = issue
+                attempts.append(attempt_record)
+                self.persist()
+                self.log(f"Rejected generated validation command attempt {attempt}: {issue}", level="error")
+                continue
+
+            risk_score, risk_summary, risk_concerns = self._score_validation_command_risk(command, generator_reason, attempt, attempts)
+            attempt_record["risk_score"] = round(risk_score, 2)
+            attempt_record["risk_summary"] = risk_summary
+            if risk_concerns:
+                attempt_record["risk_concerns"] = risk_concerns
+            if risk_score > MAX_VALIDATION_RISK_SCORE:
+                issue = f"Risk score {risk_score:.2f} exceeded max {MAX_VALIDATION_RISK_SCORE:.2f}."
+                attempt_record["accepted"] = False
+                attempt_record["rejection_reason"] = issue
+                attempts.append(attempt_record)
+                self.persist()
+                self.log(f"Rejected generated validation command attempt {attempt}: {issue}", level="error")
+                continue
+
+            preflight = run_check_command(command)
+            attempt_record["preflight_result"] = preflight.to_dict()
+            if preflight.exit_code == 0:
+                issue = "Preflight passed before edits; command is not specific enough to validate the requested change."
+                attempt_record["accepted"] = False
+                attempt_record["rejection_reason"] = issue
+                attempts.append(attempt_record)
+                self.persist()
+                self.log(f"Rejected generated validation command attempt {attempt}: {issue}", level="error")
+                continue
+
+            attempt_record["accepted"] = True
+            attempts.append(attempt_record)
+            generation["accepted_command"] = command
+            generation["accepted_risk_score"] = round(risk_score, 2)
+            generation["accepted_risk_summary"] = risk_summary
+            generation["accepted_preflight"] = preflight.to_dict()
+            self.request["validation_command"] = command
+            self.request["validation_command_source"] = "generated"
+            self.persist_request()
+            self.persist()
+            self.log(f"Accepted generated validation command on attempt {attempt}: {command}")
+            return preflight
+
+        reasons = [item.get("rejection_reason", "") for item in attempts if item.get("rejection_reason")]
+        failure_reason = "No acceptable validation command was generated within 3 attempts."
+        if reasons:
+            failure_reason += f" Last rejection: {reasons[-1]}"
+        generation["failure_reason"] = failure_reason
+        self.persist()
+        raise AppError(failure_reason)
 
     def choose_context(self, description: str, validation_before: CommandResult, depth: int) -> list[dict]:
         manifest = build_file_manifest()
@@ -1029,8 +1226,15 @@ def run_workflow(change_id: str) -> None:
     ensure_runtime_dirs()
     workflow = Workflow(change_id)
     workflow.set_status("running")
+    workflow.set_step("Generating a validation command")
+    try:
+        before = workflow.generate_validation_command()
+    except AppError as err:
+        workflow.log(f"Validation command generation failed: {err}", level="error")
+        workflow.set_status("error", error=str(err))
+        return
+
     workflow.set_step("Checking whether the change already exists")
-    before = run_check_command(workflow.request["validation_command"])
     workflow.result["validation_before"] = before.to_dict()
     workflow.persist()
 
@@ -1255,7 +1459,11 @@ def key_instructions_card(message: str) -> str:
 
 def key_instructions_page(message: str) -> str:
     body = key_instructions_card(message)
-    return html_page("Configure OpenRouter", body, subtitle="A valid OpenRouter API key is required for context gathering, planning, implementation, review, and follow-up suggestions.")
+    return html_page(
+        "Configure OpenRouter",
+        body,
+        subtitle="A valid OpenRouter API key is required for validation-command generation, risk scoring, context gathering, planning, implementation, review, and follow-up suggestions.",
+    )
 
 
 def render_recent_changes(changes: list[dict]) -> str:
@@ -1378,7 +1586,6 @@ def render_starter_gallery(starter_prompts: list[dict], selected_model: str) -> 
             tab="change",
             model=selected_model,
             description=item["prompt"],
-            check=item["validation_command"],
             budget=item["suggested_budget"],
         )
         cards.append(
@@ -1388,7 +1595,6 @@ def render_starter_gallery(starter_prompts: list[dict], selected_model: str) -> 
   <h3>{e(item['title'])}</h3>
   {repo_line}
   <p>{e(item['why'])}</p>
-  <p><strong>Suggested validation command:</strong> <code>{e(item['validation_command'])}</code></p>
   <details>
     <summary>View starter prompt</summary>
     <pre>{e(item['prompt'])}</pre>
@@ -1421,7 +1627,6 @@ def handle_home() -> None:
     selected_model = selected_model_value(params, prefs, models)
     budget = params.get("budget", str(prefs["last_budget"]))
     description = params.get("description", "")
-    validation_command = params.get("check", prefs.get("default_validation_command", ""))
     recent_changes_html = render_recent_changes(list_recent_changes())
     favorites_html = render_favorites(prefs)
     starter_prompts = load_starter_prompts()
@@ -1435,11 +1640,8 @@ def handle_home() -> None:
     primary_model_picker, primary_model_notice = render_primary_model_picker(models, prefs.get("favorite_models", []), selected_model)
     primary_notice_html = f"<p class=\"banner\">{e(primary_model_notice)}</p>" if primary_model_notice else ""
     validation_summary = (
-        f"<p class=\"banner\"><strong>Validation command:</strong> <code>{e(validation_command)}</code></p>"
-        if validation_command
-        else "<p class=\"banner\">Set a default validation command in Settings before submitting a change.</p>"
+        "<p class=\"banner\"><strong>Validation command:</strong> generated automatically from your change description, then checked by an allowlist, risk scoring, and a failing preflight requirement.</p>"
     )
-    submit_disabled = " disabled" if not validation_command else ""
     change_checked = " checked" if active_tab == "change" else ""
     gallery_checked = " checked" if active_tab == "gallery" else ""
     settings_checked = " checked" if active_tab == "settings" else ""
@@ -1462,7 +1664,6 @@ def handle_home() -> None:
       {primary_notice_html}
       {validation_summary}
       <form method="post" action="/changes" class="stack-form">
-        <input type="hidden" name="validation_command" value="{e(validation_command)}">
         {primary_model_picker}
         <label>
           <span>Change description</span>
@@ -1476,7 +1677,7 @@ def handle_home() -> None:
           <input type="checkbox" name="favorite_model" value="1">
           <span>Keep the chosen model in favorites</span>
         </label>
-        <button type="submit"{submit_disabled}>Queue change request</button>
+        <button type="submit">Queue change request</button>
       </form>
     </section>
   </section>
@@ -1491,17 +1692,10 @@ def handle_home() -> None:
     <section class="grid">
       <section class="card">
         <h2>Settings</h2>
-        <p>Store the validation command and manage how the main tab is preconfigured.</p>
+        <p>Validation commands are auto-generated per request and cannot be prefilled in Settings.</p>
         {model_warning}
         {model_source_note}
-        <form method="post" action="/preferences" class="stack-form">
-          <input type="hidden" name="action" value="save_settings">
-          <label>
-            <span>Default validation command</span>
-            <input type="text" name="default_validation_command" value="{e(validation_command)}" placeholder="python3 spec/test-suite/run.py">
-          </label>
-          <button type="submit" class="ghost-button">Save settings</button>
-        </form>
+        <p class="banner">The worker will synthesize a repo-specific validation command, reject unsafe commands, and require the preflight check to fail before edits begin.</p>
         <p><strong>Server root:</strong> <code>{e(target_root())}</code></p>
         <p><strong>Last model:</strong> <code>{e(prefs.get('last_model') or '(none yet)')}</code></p>
         <p><strong>Last budget:</strong> {e(prefs.get('last_budget'))}</p>
@@ -1531,33 +1725,29 @@ def handle_preferences_post() -> None:
     params = form_params()
     action = params.get("action", "").strip()
     model = params.get("model", "").strip()
-    default_validation_command = params.get("default_validation_command", "").strip()
     if action in {"add", "remove"} and model:
         update_favorite_model(model, action)
-    if action == "save_settings":
-        save_settings_preferences(default_validation_command)
     redirect("/?tab=settings")
 
 
 def handle_change_post() -> None:
     params = form_params()
     description = params.get("description", "").strip()
-    validation_command = params.get("validation_command", "").strip()
     model = params.get("model", "").strip()
     favorite = params.get("favorite_model", "") == "1"
     try:
         ai_budget = max(1, min(40, int(params.get("ai_budget", DEFAULT_AI_BUDGET))))
     except ValueError:
         ai_budget = DEFAULT_AI_BUDGET
-    if not description or not validation_command or not model:
+    if not description or not model:
         response_headers(status=400)
-        print(html_page("Missing fields", "<section class=\"card\"><p>Description, validation command, and model are required.</p><p><a href=\"/\">Back</a></p></section>"))
+        print(html_page("Missing fields", "<section class=\"card\"><p>Description and model are required.</p><p><a href=\"/\">Back</a></p></section>"))
         return
     if not openrouter_api_key():
         response_headers()
         print(key_instructions_page("OPENROUTER_API_KEY is missing."))
         return
-    change_id = create_change_request(description, validation_command, model, ai_budget, favorite)
+    change_id = create_change_request(description, model, ai_budget, favorite)
     spawn_worker(change_id)
     redirect(f"/changes/{change_id}")
 
@@ -1614,7 +1804,6 @@ def render_next_steps(steps: list[dict], request: dict) -> str:
         url = route_url(
             "/",
             description=item.get("description", ""),
-            check=item.get("check_command", request.get("validation_command", "")),
             model=request.get("model", ""),
             budget=request.get("ai_budget", ""),
         )
@@ -1629,6 +1818,56 @@ def render_next_steps(steps: list[dict], request: dict) -> str:
     return f"<section class=\"card\"><h2>Likely next steps</h2><ul class=\"stack-list\">{''.join(rows)}</ul></section>"
 
 
+def render_validation_generation(info: dict) -> str:
+    attempts = info.get("attempts", [])
+    if not attempts:
+        return ""
+    rows = []
+    for item in attempts:
+        attempt_no = item.get("attempt", "")
+        command = item.get("candidate_command", "")
+        outcome = "accepted" if item.get("accepted") else "rejected"
+        reason = item.get("rejection_reason", "")
+        risk_score = item.get("risk_score", "")
+        risk_summary = item.get("risk_summary", "")
+        preflight = item.get("preflight_result", {})
+        preflight_text = ""
+        if isinstance(preflight, dict) and preflight:
+            preflight_text = f"Preflight exit: {preflight.get('exit_code', '')}"
+        row = (
+            f"<li><p><strong>Attempt {e(attempt_no)}:</strong> "
+            f"<code>{e(command or '(empty)')}</code> "
+            f"<span class=\"status-chip\">{e(outcome)}</span></p>"
+        )
+        if risk_score != "":
+            row += f"<p><strong>Risk score:</strong> {e(risk_score)}"
+            if risk_summary:
+                row += f" ({e(risk_summary)})"
+            row += "</p>"
+        if preflight_text:
+            row += f"<p>{e(preflight_text)}</p>"
+        if reason:
+            row += f"<p>{e(reason)}</p>"
+        row += "</li>"
+        rows.append(row)
+    accepted = info.get("accepted_command", "")
+    failure_reason = info.get("failure_reason", "")
+    extras = ""
+    if accepted:
+        extras += f"<p><strong>Accepted command:</strong> <code>{e(accepted)}</code></p>"
+    if info.get("accepted_risk_score", "") != "":
+        extras += (
+            f"<p><strong>Accepted risk score:</strong> {e(info.get('accepted_risk_score'))} "
+            f"(max {e(info.get('risk_threshold', MAX_VALIDATION_RISK_SCORE))})</p>"
+        )
+    if failure_reason:
+        extras += f"<p><strong>Failure reason:</strong> {e(failure_reason)}</p>"
+    return (
+        f"<section class=\"card\"><h2>Validation command generation</h2>"
+        f"{extras}<ul class=\"stack-list\">{''.join(rows)}</ul></section>"
+    )
+
+
 def handle_change_detail() -> None:
     change_id = os.environ.get("PARAM_ID", "")
     request = load_request(change_id)
@@ -1639,6 +1878,7 @@ def handle_change_detail() -> None:
     running = state.get("status") in {"queued", "running"}
     refresh = REFRESH_SECONDS if running else None
     summary = f"Model {request.get('model')} with an AI budget of {request.get('ai_budget')} calls."
+    validation_command = request.get("validation_command", "") or "(pending generation)"
     status_card = f"""
 <section class="card">
   <h2>Request</h2>
@@ -1646,11 +1886,13 @@ def handle_change_detail() -> None:
   <p><strong>Status:</strong> <span class="status-chip">{e(state.get('status', 'unknown'))}</span></p>
   <p><strong>Current step:</strong> {e(state.get('current_step', ''))}</p>
   <p><strong>Server root:</strong> <code>{e(request.get('server_root', ''))}</code></p>
-  <p><strong>Validation command:</strong> <code>{e(request.get('validation_command', ''))}</code></p>
+  <p><strong>Validation command:</strong> <code>{e(validation_command)}</code></p>
   <p><a href="/">Start another change</a></p>
 </section>
 """
     pieces = [status_card]
+    if result.get("validation_command_generation"):
+        pieces.append(render_validation_generation(result["validation_command_generation"]))
     if "existing_evidence" in result:
         evidence = result["existing_evidence"]
         pieces.append(

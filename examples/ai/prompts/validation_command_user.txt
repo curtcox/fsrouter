@@ -1,0 +1,19 @@
+Server root:
+{{SERVER_ROOT}}
+
+Requested change:
+{{CHANGE_DESCRIPTION}}
+
+Attempt:
+{{ATTEMPT_NUMBER}} of {{MAX_ATTEMPTS}}
+
+Previous rejection reasons:
+{{PREVIOUS_REJECTIONS}}
+
+AI calls remaining after this step:
+{{AI_CALLS_REMAINING}}
+
+Visible file manifest:
+{{FILE_MANIFEST}}
+
+Return only the JSON object.

@@ -199,6 +199,9 @@ cd python && python3 fsrouter.py
 
 Located in `examples/ai/`.
 
+The app now auto-generates a validation command per request, risk-scores it,
+and requires the preflight check to fail before any filesystem edits begin.
+
 - Run:
 
 ```bash
