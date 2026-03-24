@@ -201,6 +201,7 @@ def models_cache_path() -> Path:
 
 def default_preferences() -> dict:
     return {
+        "default_validation_command": "",
         "favorite_models": [],
         "last_budget": DEFAULT_AI_BUDGET,
         "last_model": "",
@@ -221,6 +222,7 @@ def load_preferences() -> dict:
         merged["last_budget"] = max(1, int(merged.get("last_budget", DEFAULT_AI_BUDGET)))
     except (TypeError, ValueError):
         merged["last_budget"] = DEFAULT_AI_BUDGET
+    merged["default_validation_command"] = str(merged.get("default_validation_command", "")).strip()
     merged["last_model"] = str(merged.get("last_model", "")).strip()
     return merged
 
@@ -246,6 +248,12 @@ def update_favorite_model(model: str, action: str) -> None:
     if action == "remove":
         favorites = [item for item in favorites if item != model]
     prefs["favorite_models"] = favorites
+    save_preferences(prefs)
+
+
+def save_settings_preferences(default_validation_command: str) -> None:
+    prefs = load_preferences()
+    prefs["default_validation_command"] = default_validation_command.strip()
     save_preferences(prefs)
 
 
@@ -1161,6 +1169,67 @@ def selected_model_value(params: dict[str, str], prefs: dict, models: list[dict]
     return ""
 
 
+def render_model_picker(models: list[dict], favorites: list[str], selected_model: str, field_name: str, label_text: str) -> str:
+    if not models:
+        return f"""
+<label>
+  <span>{e(label_text)}</span>
+  <input type="text" name="{e(field_name)}" value="{e(selected_model)}" required>
+</label>
+"""
+
+
+def render_primary_model_picker(models: list[dict], favorites: list[str], selected_model: str) -> tuple[str, str]:
+    if not favorites:
+        if models:
+            message = "No favorite models are saved yet, so the primary tab is temporarily showing the full catalog. Add favorites in Settings to keep this list focused."
+        else:
+            message = "No favorite models are saved yet and the live catalog is unavailable, so enter a model id here for now and save favorites in Settings later."
+        return render_model_picker(models, favorites, selected_model, "model", "Favorite model"), message
+
+    favorite_models = [item for item in models if item["id"] in set(favorites)]
+    selected = selected_model if selected_model in favorites else favorites[0]
+    if selected_model and selected_model not in favorites:
+        notice = f"Last selected model {selected_model} is not a favorite yet, so the primary tab is using {selected}."
+    else:
+        notice = ""
+    return render_model_picker(favorite_models, favorites, selected, "model", "Favorite model"), notice
+
+    favorite_set = {model for model in favorites}
+    known_ids = {item["id"] for item in models}
+    favorite_options = [item for item in models if item["id"] in favorite_set]
+    all_other_options = [item for item in models if item["id"] not in favorite_set]
+
+    def option_markup(item: dict) -> str:
+        details = []
+        if item.get("name") and item["name"] != item["id"]:
+            details.append(item["name"])
+        if item.get("context_length"):
+            details.append(f"{item['context_length']} ctx")
+        label = " | ".join(details) if details else item["id"]
+        selected_attr = " selected" if item["id"] == selected_model else ""
+        return f"<option value=\"{e(item['id'])}\"{selected_attr}>{e(item['id'])} - {e(label)}</option>"
+
+    extra_option = ""
+    if selected_model and selected_model not in known_ids:
+        extra_option = f"<option value=\"{e(selected_model)}\" selected>{e(selected_model)} - current saved value</option>"
+
+    favorite_markup = "".join(option_markup(item) for item in favorite_options)
+    other_markup = "".join(option_markup(item) for item in all_other_options)
+    favorites_group = f"<optgroup label=\"Favorites\">{favorite_markup}</optgroup>" if favorite_markup else ""
+    catalog_group = f"<optgroup label=\"OpenRouter catalog\">{other_markup}</optgroup>"
+    return f"""
+<label>
+  <span>{e(label_text)}</span>
+  <select name="{e(field_name)}" required>
+    {extra_option}
+    {favorites_group}
+    {catalog_group}
+  </select>
+</label>
+"""
+
+
 def handle_home() -> None:
     ensure_runtime_dirs()
     prefs = load_preferences()
@@ -1174,61 +1243,93 @@ def handle_home() -> None:
         models, model_notice = [], str(err)
 
     params = query_params()
+    active_tab = "settings" if params.get("tab", "").strip() == "settings" else "change"
     selected_model = selected_model_value(params, prefs, models)
     budget = params.get("budget", str(prefs["last_budget"]))
     description = params.get("description", "")
-    validation_command = params.get("check", "")
-    models_markup = "".join(
-        f"<option value=\"{e(item['id'])}\">{e(item['name'])}</option>" for item in models
-    )
+    validation_command = params.get("check", prefs.get("default_validation_command", ""))
     recent_changes_html = render_recent_changes(list_recent_changes())
     favorites_html = render_favorites(prefs)
     model_warning = f"<p class=\"banner\">{e(model_notice)}</p>" if model_notice else ""
+    model_source_note = ""
+    if models:
+        model_source_note = (
+            f"<p class=\"banner\">Loaded {len(models)} current models from "
+            "<code>https://openrouter.ai/api/v1/models</code>.</p>"
+        )
+    primary_model_picker, primary_model_notice = render_primary_model_picker(models, prefs.get("favorite_models", []), selected_model)
+    primary_notice_html = f"<p class=\"banner\">{e(primary_model_notice)}</p>" if primary_model_notice else ""
+    validation_summary = (
+        f"<p class=\"banner\"><strong>Validation command:</strong> <code>{e(validation_command)}</code></p>"
+        if validation_command
+        else "<p class=\"banner\">Set a default validation command in Settings before submitting a change.</p>"
+    )
+    submit_disabled = " disabled" if not validation_command else ""
+    change_checked = " checked" if active_tab == "change" else ""
+    settings_checked = " checked" if active_tab == "settings" else ""
     body = f"""
-<section class="grid">
-  <section class="card">
-    <h2>Request a change</h2>
-    <p>Describe the change, provide the failing or validating command, choose an OpenRouter model, and set the total AI call budget for this run.</p>
-    {model_warning}
-    <form method="post" action="/changes" class="stack-form">
-      <label>
-        <span>Change description</span>
-        <textarea name="description" rows="8" required>{e(description)}</textarea>
-      </label>
-      <label>
-        <span>Validation command</span>
-        <input type="text" name="validation_command" value="{e(validation_command)}" placeholder="python3 spec/test-suite/run.py" required>
-      </label>
-      <label>
-        <span>Model</span>
-        <input type="text" name="model" value="{e(selected_model)}" list="model-options" required>
-        <datalist id="model-options">
-          {models_markup}
-        </datalist>
-      </label>
-      <label>
-        <span>Total AI call budget</span>
-        <input type="number" min="1" max="40" name="ai_budget" value="{e(budget)}" required>
-      </label>
-      <label class="checkbox-row">
-        <input type="checkbox" name="favorite_model" value="1">
-        <span>Save this model as a favorite</span>
-      </label>
-      <button type="submit">Queue change request</button>
-    </form>
+<section class="tabs">
+  <input type="radio" name="home-tab" id="tab-change" class="tab-toggle"{change_checked}>
+  <input type="radio" name="home-tab" id="tab-settings" class="tab-toggle"{settings_checked}>
+  <div class="tab-strip">
+    <label for="tab-change" class="tab-label">Change</label>
+    <label for="tab-settings" class="tab-label">Settings</label>
+  </div>
+  <section class="tab-panel tab-panel-change">
+    <section class="card">
+      <h2>Request a change</h2>
+      <p>Pick a favorite model, describe the change, set the AI budget, and submit.</p>
+      {model_warning}
+      {primary_notice_html}
+      {validation_summary}
+      <form method="post" action="/changes" class="stack-form">
+        <input type="hidden" name="validation_command" value="{e(validation_command)}">
+        {primary_model_picker}
+        <label>
+          <span>Change description</span>
+          <textarea name="description" rows="8" required>{e(description)}</textarea>
+        </label>
+        <label>
+          <span>Total AI call budget</span>
+          <input type="number" min="1" max="40" name="ai_budget" value="{e(budget)}" required>
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" name="favorite_model" value="1">
+          <span>Keep the chosen model in favorites</span>
+        </label>
+        <button type="submit"{submit_disabled}>Queue change request</button>
+      </form>
+    </section>
   </section>
-  <section class="card">
-    <h2>Workspace</h2>
-    <p><strong>Server root:</strong> <code>{e(target_root())}</code></p>
-    <p><strong>Last model:</strong> <code>{e(prefs.get('last_model') or '(none yet)')}</code></p>
-    <p><strong>Last budget:</strong> {e(prefs.get('last_budget'))}</p>
-    <h3>Favorite models</h3>
-    {favorites_html}
-    <form method="post" action="/preferences" class="inline-form">
-      <input type="hidden" name="action" value="add">
-      <input type="text" name="model" value="{e(selected_model)}" list="model-options" required>
-      <button type="submit" class="ghost-button">Add favorite</button>
-    </form>
+  <section class="tab-panel tab-panel-settings">
+    <section class="grid">
+      <section class="card">
+        <h2>Settings</h2>
+        <p>Store the validation command and manage how the main tab is preconfigured.</p>
+        {model_warning}
+        {model_source_note}
+        <form method="post" action="/preferences" class="stack-form">
+          <input type="hidden" name="action" value="save_settings">
+          <label>
+            <span>Default validation command</span>
+            <input type="text" name="default_validation_command" value="{e(validation_command)}" placeholder="python3 spec/test-suite/run.py">
+          </label>
+          <button type="submit" class="ghost-button">Save settings</button>
+        </form>
+        <p><strong>Server root:</strong> <code>{e(target_root())}</code></p>
+        <p><strong>Last model:</strong> <code>{e(prefs.get('last_model') or '(none yet)')}</code></p>
+        <p><strong>Last budget:</strong> {e(prefs.get('last_budget'))}</p>
+      </section>
+      <section class="card">
+        <h2>Favorite models</h2>
+        {favorites_html}
+        <form method="post" action="/preferences" class="inline-form">
+          <input type="hidden" name="action" value="add">
+          {render_model_picker(models, prefs.get("favorite_models", []), selected_model, "model", "Add a favorite model")}
+          <button type="submit" class="ghost-button">Add favorite</button>
+        </form>
+      </section>
+    </section>
   </section>
 </section>
 <section class="card">
@@ -1244,9 +1345,12 @@ def handle_preferences_post() -> None:
     params = form_params()
     action = params.get("action", "").strip()
     model = params.get("model", "").strip()
+    default_validation_command = params.get("default_validation_command", "").strip()
     if action in {"add", "remove"} and model:
         update_favorite_model(model, action)
-    redirect("/")
+    if action == "save_settings":
+        save_settings_preferences(default_validation_command)
+    redirect("/?tab=settings")
 
 
 def handle_change_post() -> None:

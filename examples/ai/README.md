@@ -42,3 +42,6 @@ Then open [http://localhost:8080](http://localhost:8080).
   can be diffed and versioned independently.
 - The change worker runs in a detached subprocess, so the web request can return
   immediately and the change page can poll for progress.
+- The home page loads the complete current model catalog from
+  `https://openrouter.ai/api/v1/models` and presents it as the picker the user
+  chooses from.

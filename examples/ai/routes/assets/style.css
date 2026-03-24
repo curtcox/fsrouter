@@ -79,6 +79,50 @@ h1 {
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
 }
 
+.tabs {
+  display: grid;
+  gap: 1rem;
+}
+
+.tab-toggle {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tab-strip {
+  display: inline-flex;
+  gap: 0.5rem;
+  padding: 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.62);
+  width: fit-content;
+}
+
+.tab-label {
+  padding: 0.65rem 1rem;
+  border-radius: 999px;
+  text-decoration: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.tab-panel {
+  display: none;
+}
+
+#tab-change:checked ~ .tab-strip label[for="tab-change"],
+#tab-settings:checked ~ .tab-strip label[for="tab-settings"] {
+  background: linear-gradient(135deg, var(--accent) 0%, #2f8d79 100%);
+  color: white;
+}
+
+#tab-change:checked ~ .tab-panel-change,
+#tab-settings:checked ~ .tab-panel-settings {
+  display: block;
+}
+
 .card,
 .notice {
   border: 1px solid var(--line);
@@ -140,6 +184,7 @@ label span {
 
 input[type="text"],
 input[type="number"],
+select,
 textarea {
   width: 100%;
   border: 1px solid rgba(22, 37, 31, 0.24);
@@ -171,6 +216,11 @@ button {
   padding: 0.8rem 1.15rem;
   background: linear-gradient(135deg, var(--accent) 0%, #2f8d79 100%);
   color: white;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .ghost-button,
