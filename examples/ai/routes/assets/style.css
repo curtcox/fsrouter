@@ -113,13 +113,15 @@ h1 {
 }
 
 #tab-change:checked ~ .tab-strip label[for="tab-change"],
-#tab-settings:checked ~ .tab-strip label[for="tab-settings"] {
+#tab-settings:checked ~ .tab-strip label[for="tab-settings"],
+#tab-gallery:checked ~ .tab-strip label[for="tab-gallery"] {
   background: linear-gradient(135deg, var(--accent) 0%, #2f8d79 100%);
   color: white;
 }
 
 #tab-change:checked ~ .tab-panel-change,
-#tab-settings:checked ~ .tab-panel-settings {
+#tab-settings:checked ~ .tab-panel-settings,
+#tab-gallery:checked ~ .tab-panel-gallery {
   display: block;
 }
 
@@ -139,10 +141,42 @@ h1 {
 
 .stack-form,
 .inline-form,
+.inline-actions,
 .stack-list,
 .favorites {
   display: grid;
   gap: 0.9rem;
+}
+
+.inline-actions {
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  align-items: center;
+  justify-content: start;
+}
+
+.gallery-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.gallery-card {
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.gallery-card h3 {
+  margin-bottom: 0.35rem;
+}
+
+.gallery-meta {
+  color: var(--accent-2);
+  font-size: 0.82rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .stack-list,
@@ -251,6 +285,20 @@ pre {
   background: rgba(22, 37, 31, 0.05);
   border-radius: 16px;
   padding: 0.95rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+th,
+td {
+  padding: 0.7rem 0.65rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
 }
 
 ol,

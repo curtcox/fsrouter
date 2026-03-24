@@ -15,6 +15,10 @@ uses OpenRouter to:
 9. Show a linked list of the resulting diffs.
 10. Suggest likely follow-up requests with prefilled links back to the form.
 
+It also includes a gallery of starter change requests so users can browse
+examples, learn what kinds of changes the app can make, and prefill the form
+with a customizable starting point.
+
 ## Run
 
 From the repository root:
@@ -40,6 +44,11 @@ Then open [http://localhost:8080](http://localhost:8080).
 - Runtime state is written under `examples/ai/data/`.
 - Prompt templates live in `examples/ai/prompts/` as plain text files so they
   can be diffed and versioned independently.
+- Starter gallery prompts live in `examples/ai/starter-prompts/` as individual
+  plain text files.
+- The starter gallery includes simple and advanced examples across CLI, HTML,
+  JavaScript, web API, and machine-facing workflows such as QR reading, network
+  scanning, and scheduling UI ideas.
 - The change worker runs in a detached subprocess, so the web request can return
   immediately and the change page can poll for progress.
 - The home page loads the complete current model catalog from

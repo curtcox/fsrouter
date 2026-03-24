@@ -1,0 +1,1 @@
+Add or extend a job-status endpoint so it returns progress percentage, current step, last updated time, and a structured error field when a render fails.

@@ -1,0 +1,1 @@
+Persist the last-used form values or template controls in localStorage, restore them on reload, and add a reset action that clears the saved state.

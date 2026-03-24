@@ -1,0 +1,1 @@
+Add --json output and --dry-run mode to the main render command. Make common failures return stable non-zero exit codes and update the help text with examples.

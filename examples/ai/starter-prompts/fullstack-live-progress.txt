@@ -1,0 +1,1 @@
+Use the job-status API from the browser to show a progress bar, current step text, and the latest log lines while a long-running job is in progress.

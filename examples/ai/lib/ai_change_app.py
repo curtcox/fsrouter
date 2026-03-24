@@ -177,11 +177,11 @@ def redirect(location: str, status: int = 303) -> None:
     response_headers(status=status, extra={"Location": location})
 
 
-def route_url(path: str, **params: str | int | None) -> str:
+def route_url(base_path: str, **params: str | int | None) -> str:
     items = [(key, str(value)) for key, value in params.items() if value is not None and value != ""]
     if not items:
-        return path
-    return f"{path}?{urllib.parse.urlencode(items)}"
+        return base_path
+    return f"{base_path}?{urllib.parse.urlencode(items)}"
 
 
 def prompt_text(name: str, values: dict[str, str]) -> str:
@@ -502,10 +502,10 @@ def render_context_blocks(items: list[dict]) -> str:
     return shorten(combined, MAX_CONTEXT_CHARS)
 
 
-def run_check_command(command: str) -> CommandResult:
+def run_check_command(command: str, *, timeout_override: int | None = None) -> CommandResult:
     start = time.time()
     shell = os.environ.get("SHELL", "/bin/sh")
-    timeout = int(os.environ.get("AI_CHANGE_COMMAND_TIMEOUT", str(DEFAULT_COMMAND_TIMEOUT)) or DEFAULT_COMMAND_TIMEOUT)
+    timeout = timeout_override or int(os.environ.get("AI_CHANGE_COMMAND_TIMEOUT", str(DEFAULT_COMMAND_TIMEOUT)) or DEFAULT_COMMAND_TIMEOUT)
     try:
         proc = subprocess.Popen(
             [shell, "-lc", command],
@@ -1085,6 +1085,138 @@ def run_workflow(change_id: str) -> None:
     workflow.set_status("completed")
 
 
+def starter_prompt_dir() -> Path:
+    return APP_ROOT / "starter-prompts"
+
+
+def starter_prompt_specs() -> list[dict]:
+    return [
+        {
+            "id": "cli-json-dry-run",
+            "title": "Add --json and --dry-run to a render CLI",
+            "difficulty": "Easy",
+            "tech_focus": "Command line app",
+            "suggested_budget": 3,
+            "validation_command": "./bin/render --help && ./bin/render sample-manifest.json --dry-run --json",
+            "why": "Shows how the app can make a small, structured CLI improvement with help text, flags, and stable output.",
+            "repo_label": "Generic CLI project",
+            "file": "cli-json-dry-run.txt",
+        },
+        {
+            "id": "html-responsive-preview",
+            "title": "Make a preview page responsive and accessible",
+            "difficulty": "Easy",
+            "tech_focus": "HTML",
+            "suggested_budget": 3,
+            "validation_command": "npm run build",
+            "why": "Shows a focused front-end task with semantic markup, mobile layout, and visible UX polish.",
+            "repo_label": "Generic web app",
+            "file": "html-responsive-preview.txt",
+        },
+        {
+            "id": "js-localstorage-settings",
+            "title": "Persist recent template settings in localStorage",
+            "difficulty": "Medium",
+            "tech_focus": "JavaScript",
+            "suggested_budget": 5,
+            "validation_command": "npm test",
+            "why": "Shows client-side state management and a reset flow without needing a backend migration.",
+            "repo_label": "Generic browser app",
+            "file": "js-localstorage-settings.txt",
+        },
+        {
+            "id": "api-job-status",
+            "title": "Add progress metadata to a job status API",
+            "difficulty": "Medium",
+            "tech_focus": "Web API",
+            "suggested_budget": 5,
+            "validation_command": "pytest tests/test_jobs_api.py",
+            "why": "Shows how the app can extend a backend API contract and tighten response structure.",
+            "repo_label": "Generic service/API project",
+            "file": "api-job-status.txt",
+        },
+        {
+            "id": "fullstack-live-progress",
+            "title": "Show live progress for long-running jobs",
+            "difficulty": "Medium",
+            "tech_focus": "HTML + JavaScript + web API",
+            "suggested_budget": 6,
+            "validation_command": "npm test && npm run build",
+            "why": "Shows a cross-layer change that links API polling to browser UI updates and user feedback.",
+            "repo_label": "Generic full-stack app",
+            "file": "fullstack-live-progress.txt",
+        },
+        {
+            "id": "cli-api-batch-mode",
+            "title": "Add batch submission with concurrency and resume",
+            "difficulty": "Hard",
+            "tech_focus": "Command line app + web API",
+            "suggested_budget": 8,
+            "validation_command": "pytest tests/test_batch_mode.py",
+            "why": "Shows orchestration work with manifests, retry behavior, and long-running job handling.",
+            "repo_label": "Generic automation pipeline",
+            "file": "cli-api-batch-mode.txt",
+        },
+        {
+            "id": "html-to-video-storyboard",
+            "title": "Add storyboard mode to HTML-to-video-pipeline",
+            "difficulty": "Hard",
+            "tech_focus": "HTML + JavaScript + command line app + web API",
+            "suggested_budget": 10,
+            "validation_command": "npm test && node cli/render.js examples/storyboard.json --dry-run",
+            "why": "Shows a self-referential, iterative example that spans preview rendering, manifests, and promotion into a full render flow.",
+            "repo_label": "HTML-to-video-pipeline",
+            "repo_url": "https://github.com/curtcox/HTML-to-video-pipeline",
+            "file": "html-to-video-storyboard.txt",
+        },
+        {
+            "id": "qr-reader-workflow",
+            "title": "Add a QR code reader workflow to the app",
+            "difficulty": "Hard",
+            "tech_focus": "HTML + JavaScript + browser APIs + app integration",
+            "suggested_budget": 8,
+            "validation_command": "python3 -m py_compile examples/ai/lib/ai_change_app.py",
+            "why": "Shows a browser-device feature that combines camera access, QR detection, and multiple follow-up actions inside the app.",
+            "repo_label": "This AI change assistant",
+            "file": "qr-reader-workflow.txt",
+        },
+        {
+            "id": "network-scanner-ui",
+            "title": "Add a network scanner with a topology view",
+            "difficulty": "Hard",
+            "tech_focus": "Command line tools + web UI + topology visualization",
+            "suggested_budget": 9,
+            "validation_command": "python3 -m py_compile examples/ai/lib/ai_change_app.py",
+            "why": "Shows a system-level change that combines discovery commands, structured results, and a richer visual interface.",
+            "repo_label": "This AI change assistant",
+            "file": "network-scanner-ui.txt",
+        },
+        {
+            "id": "scheduler-management-ui",
+            "title": "Add a scheduler management UI for this machine",
+            "difficulty": "Hard",
+            "tech_focus": "System integration + web UI",
+            "suggested_budget": 8,
+            "validation_command": "python3 -m py_compile examples/ai/lib/ai_change_app.py",
+            "why": "Shows a machine-management workflow that reads current scheduled work and safely adds or removes jobs from a browser.",
+            "repo_label": "This AI change assistant",
+            "file": "scheduler-management-ui.txt",
+        },
+    ]
+
+
+def load_starter_prompts() -> list[dict]:
+    prompts = []
+    for spec in starter_prompt_specs():
+        prompt_path = starter_prompt_dir() / spec["file"]
+        prompt_text_value = read_text(prompt_path).strip()
+        item = dict(spec)
+        item["prompt"] = prompt_text_value
+        item["file_url"] = route_url("/file", path=f"examples/ai/starter-prompts/{spec['file']}")
+        prompts.append(item)
+    return prompts
+
+
 def render_command_result(result: dict, heading: str) -> str:
     stdout = result.get("stdout", "")
     stderr = result.get("stderr", "")
@@ -1105,8 +1237,8 @@ def render_command_result(result: dict, heading: str) -> str:
 """
 
 
-def key_instructions_page(message: str) -> str:
-    body = f"""
+def key_instructions_card(message: str) -> str:
+    return f"""
 <section class="card">
   <h2>OpenRouter setup required</h2>
   <p>{e(message)}</p>
@@ -1119,6 +1251,10 @@ def key_instructions_page(message: str) -> str:
   <p>This example keeps runtime state under <code>{e(DATA_ROOT)}</code> and reads files relative to <code>{e(target_root())}</code>.</p>
 </section>
 """
+ 
+
+def key_instructions_page(message: str) -> str:
+    body = key_instructions_card(message)
     return html_page("Configure OpenRouter", body, subtitle="A valid OpenRouter API key is required for context gathering, planning, implementation, review, and follow-up suggestions.")
 
 
@@ -1177,24 +1313,6 @@ def render_model_picker(models: list[dict], favorites: list[str], selected_model
   <input type="text" name="{e(field_name)}" value="{e(selected_model)}" required>
 </label>
 """
-
-
-def render_primary_model_picker(models: list[dict], favorites: list[str], selected_model: str) -> tuple[str, str]:
-    if not favorites:
-        if models:
-            message = "No favorite models are saved yet, so the primary tab is temporarily showing the full catalog. Add favorites in Settings to keep this list focused."
-        else:
-            message = "No favorite models are saved yet and the live catalog is unavailable, so enter a model id here for now and save favorites in Settings later."
-        return render_model_picker(models, favorites, selected_model, "model", "Favorite model"), message
-
-    favorite_models = [item for item in models if item["id"] in set(favorites)]
-    selected = selected_model if selected_model in favorites else favorites[0]
-    if selected_model and selected_model not in favorites:
-        notice = f"Last selected model {selected_model} is not a favorite yet, so the primary tab is using {selected}."
-    else:
-        notice = ""
-    return render_model_picker(favorite_models, favorites, selected, "model", "Favorite model"), notice
-
     favorite_set = {model for model in favorites}
     known_ids = {item["id"] for item in models}
     favorite_options = [item for item in models if item["id"] in favorite_set]
@@ -1230,26 +1348,83 @@ def render_primary_model_picker(models: list[dict], favorites: list[str], select
 """
 
 
+def render_primary_model_picker(models: list[dict], favorites: list[str], selected_model: str) -> tuple[str, str]:
+    if not favorites:
+        if models:
+            message = "No favorite models are saved yet, so the primary tab is temporarily showing the full catalog. Add favorites in Settings to keep this list focused."
+        else:
+            message = "No favorite models are saved yet and the live catalog is unavailable, so enter a model id here for now and save favorites in Settings later."
+        return render_model_picker(models, favorites, selected_model, "model", "Favorite model"), message
+
+    favorite_models = [item for item in models if item["id"] in set(favorites)]
+    selected = selected_model if selected_model in favorites else favorites[0]
+    if selected_model and selected_model not in favorites:
+        notice = f"Last selected model {selected_model} is not a favorite yet, so the primary tab is using {selected}."
+    else:
+        notice = ""
+    return render_model_picker(favorite_models, favorites, selected, "model", "Favorite model"), notice
+
+
+def render_starter_gallery(starter_prompts: list[dict], selected_model: str) -> str:
+    cards = []
+    for item in starter_prompts:
+        repo_line = ""
+        if item.get("repo_url"):
+            repo_line = f"<p><strong>Example repo:</strong> <a href=\"{e(item['repo_url'])}\">{e(item['repo_label'])}</a></p>"
+        else:
+            repo_line = f"<p><strong>Example repo:</strong> {e(item['repo_label'])}</p>"
+        use_url = route_url(
+            "/",
+            tab="change",
+            model=selected_model,
+            description=item["prompt"],
+            check=item["validation_command"],
+            budget=item["suggested_budget"],
+        )
+        cards.append(
+            f"""
+<article class="gallery-card">
+  <p class="gallery-meta">{e(item['difficulty'])} · {e(item['tech_focus'])}</p>
+  <h3>{e(item['title'])}</h3>
+  {repo_line}
+  <p>{e(item['why'])}</p>
+  <p><strong>Suggested validation command:</strong> <code>{e(item['validation_command'])}</code></p>
+  <details>
+    <summary>View starter prompt</summary>
+    <pre>{e(item['prompt'])}</pre>
+    <p><a href="{e(item['file_url'])}">Open prompt file</a></p>
+  </details>
+  <div class="inline-actions">
+    <a class="chip-link" href="{e(use_url)}">Use as a starting point</a>
+  </div>
+</article>
+"""
+        )
+    return "<section class=\"gallery-grid\">" + "".join(cards) + "</section>"
+
+
 def handle_home() -> None:
     ensure_runtime_dirs()
     prefs = load_preferences()
+    setup_notice = ""
     try:
         models, model_notice = list_available_models()
     except InvalidAPIKeyError as err:
-        response_headers()
-        print(key_instructions_page(str(err)))
-        return
+        models, model_notice = [], str(err)
+        setup_notice = key_instructions_card(str(err))
     except AppError as err:
         models, model_notice = [], str(err)
 
     params = query_params()
-    active_tab = "settings" if params.get("tab", "").strip() == "settings" else "change"
+    requested_tab = params.get("tab", "").strip()
+    active_tab = requested_tab if requested_tab in {"gallery", "settings"} else "change"
     selected_model = selected_model_value(params, prefs, models)
     budget = params.get("budget", str(prefs["last_budget"]))
     description = params.get("description", "")
     validation_command = params.get("check", prefs.get("default_validation_command", ""))
     recent_changes_html = render_recent_changes(list_recent_changes())
     favorites_html = render_favorites(prefs)
+    starter_prompts = load_starter_prompts()
     model_warning = f"<p class=\"banner\">{e(model_notice)}</p>" if model_notice else ""
     model_source_note = ""
     if models:
@@ -1266,19 +1441,23 @@ def handle_home() -> None:
     )
     submit_disabled = " disabled" if not validation_command else ""
     change_checked = " checked" if active_tab == "change" else ""
+    gallery_checked = " checked" if active_tab == "gallery" else ""
     settings_checked = " checked" if active_tab == "settings" else ""
     body = f"""
+{setup_notice}
 <section class="tabs">
   <input type="radio" name="home-tab" id="tab-change" class="tab-toggle"{change_checked}>
+  <input type="radio" name="home-tab" id="tab-gallery" class="tab-toggle"{gallery_checked}>
   <input type="radio" name="home-tab" id="tab-settings" class="tab-toggle"{settings_checked}>
   <div class="tab-strip">
     <label for="tab-change" class="tab-label">Change</label>
+    <label for="tab-gallery" class="tab-label">Gallery</label>
     <label for="tab-settings" class="tab-label">Settings</label>
   </div>
   <section class="tab-panel tab-panel-change">
     <section class="card">
       <h2>Request a change</h2>
-      <p>Pick a favorite model, describe the change, set the AI budget, and submit.</p>
+      <p>Pick a favorite model, describe the change, optionally start from a gallery example, set the AI budget, and submit.</p>
       {model_warning}
       {primary_notice_html}
       {validation_summary}
@@ -1299,6 +1478,13 @@ def handle_home() -> None:
         </label>
         <button type="submit"{submit_disabled}>Queue change request</button>
       </form>
+    </section>
+  </section>
+  <section class="tab-panel tab-panel-gallery">
+    <section class="card">
+      <h2>Starter gallery</h2>
+      <p>These are example change requests meant to teach what the app can do. Pick one, customize it on the Change tab, then submit when it matches what you want.</p>
+      {render_starter_gallery(starter_prompts, selected_model)}
     </section>
   </section>
   <section class="tab-panel tab-panel-settings">
