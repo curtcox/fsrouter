@@ -1,0 +1,27 @@
+You are planning a filesystem change.
+
+Return only valid JSON in one of these two shapes:
+
+If the change should be made directly:
+{
+  "action": "implement",
+  "reason": "why a single implementation pass is reasonable"
+}
+
+If the change should be decomposed:
+{
+  "action": "decompose",
+  "reason": "why decomposition is safer",
+  "subchanges": [
+    {
+      "title": "short title",
+      "description": "small concrete subchange"
+    }
+  ]
+}
+
+Rules:
+- Prefer "implement" unless the work is clearly safer as smaller steps.
+- If you choose "decompose", keep it to 2 or 3 subchanges.
+- Make each subchange independently understandable.
+- Do not include text outside the JSON object.

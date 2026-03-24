@@ -10,6 +10,7 @@ This repository contains a protocol/specification plus multiple implementations 
 .
 ├── bash/
 ├── deno/
+├── examples/
 ├── groovy/
 ├── LICENSE.md
 ├── lua/
@@ -23,6 +24,8 @@ This repository contains a protocol/specification plus multiple implementations 
 ├── tools/
 └── spec/
 ```
+
+The `examples/` tree contains runnable sample apps built on top of fsrouter.
 
 ## What fsrouter does
 
@@ -189,6 +192,22 @@ cd python && python3 fsrouter.py
 
 - Docs:
   - `python/README.md`
+
+## Examples
+
+### AI change assistant
+
+Located in `examples/ai/`.
+
+- Run:
+
+```bash
+export OPENROUTER_API_KEY=your_key_here
+ROUTE_DIR=examples/ai/routes python3 python/fsrouter.py
+```
+
+- Docs:
+  - `examples/ai/README.md`
 
 ### Ruby
 

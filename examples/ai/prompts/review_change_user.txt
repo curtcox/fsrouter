@@ -1,0 +1,25 @@
+Requested change:
+{{CHANGE_DESCRIPTION}}
+
+Validation command:
+{{VALIDATION_COMMAND}}
+
+Validation exit code:
+{{VALIDATION_EXIT_CODE}}
+
+Validation stdout:
+{{VALIDATION_STDOUT}}
+
+Validation stderr:
+{{VALIDATION_STDERR}}
+
+AI calls remaining after this step:
+{{AI_CALLS_REMAINING}}
+
+Context that informed the change:
+{{CONTEXT_BLOCKS}}
+
+Proposed diffs:
+{{PROPOSED_DIFFS}}
+
+Return only the JSON object.

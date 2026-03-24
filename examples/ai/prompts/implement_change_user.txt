@@ -1,0 +1,25 @@
+Requested change:
+{{CHANGE_DESCRIPTION}}
+
+Validation command:
+{{VALIDATION_COMMAND}}
+
+Validation exit code:
+{{VALIDATION_EXIT_CODE}}
+
+Validation stdout:
+{{VALIDATION_STDOUT}}
+
+Validation stderr:
+{{VALIDATION_STDERR}}
+
+AI calls remaining after this step:
+{{AI_CALLS_REMAINING}}
+
+Recursion depth:
+{{RECURSION_DEPTH}}
+
+Required context:
+{{CONTEXT_BLOCKS}}
+
+Return only the JSON object.

@@ -1,0 +1,28 @@
+Server root:
+{{SERVER_ROOT}}
+
+Requested change:
+{{CHANGE_DESCRIPTION}}
+
+Validation command:
+{{VALIDATION_COMMAND}}
+
+Validation exit code:
+{{VALIDATION_EXIT_CODE}}
+
+Validation stdout:
+{{VALIDATION_STDOUT}}
+
+Validation stderr:
+{{VALIDATION_STDERR}}
+
+AI calls remaining after this step:
+{{AI_CALLS_REMAINING}}
+
+Recursion depth:
+{{RECURSION_DEPTH}}
+
+Visible file manifest:
+{{FILE_MANIFEST}}
+
+Return only the JSON object.
