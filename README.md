@@ -20,6 +20,7 @@ This repository contains a protocol/specification plus multiple implementations 
 ├── python/
 ├── ruby/
 ├── rust/
+├── tools/
 └── spec/
 ```
 
@@ -270,7 +271,7 @@ FSROUTER_IMPL=ruby python3 spec/test-suite/run.py
 
 ## Configuration
 
-All implementations use the same environment variables:
+All implementations use the same core environment variables:
 
 - `ROUTE_DIR`
 - `LISTEN_ADDR`
@@ -281,6 +282,62 @@ Typical usage:
 ```bash
 ROUTE_DIR=./routes LISTEN_ADDR=:8080 COMMAND_TIMEOUT=30
 ```
+
+`LISTEN_ADDR` controls whether the server accepts only local requests or
+requests from beyond the local machine:
+
+- `127.0.0.1:8080` or `[::1]:8080` for local-only access
+- `:8080`, `0.0.0.0:8080`, or `[::]:8080` for access beyond the local machine
+
+The repository also includes `tools/fsrouter-watch.py`, a lightweight wrapper
+that provides automatic route reloads by restarting the chosen implementation
+when route-discovery-relevant files change.
+
+## Run modes
+
+The examples below use the Python implementation because it runs directly:
+
+```bash
+python3 python/fsrouter.py
+```
+
+Replace that command with any implementation command from the sections above if
+you prefer a different runtime.
+
+### Local-only access, no hot reload
+
+```bash
+ROUTE_DIR=./routes LISTEN_ADDR=127.0.0.1:8080 COMMAND_TIMEOUT=30 \
+python3 python/fsrouter.py
+```
+
+### Access beyond the local machine, no hot reload
+
+```bash
+ROUTE_DIR=./routes LISTEN_ADDR=:8080 COMMAND_TIMEOUT=30 \
+python3 python/fsrouter.py
+```
+
+If you use a non-loopback bind, make sure your firewall and network policy allow
+the port you chose.
+
+### Local-only access, with hot reload
+
+```bash
+ROUTE_DIR=./routes LISTEN_ADDR=127.0.0.1:8080 COMMAND_TIMEOUT=30 \
+python3 tools/fsrouter-watch.py -- python3 python/fsrouter.py
+```
+
+### Access beyond the local machine, with hot reload
+
+```bash
+ROUTE_DIR=./routes LISTEN_ADDR=:8080 COMMAND_TIMEOUT=30 \
+python3 tools/fsrouter-watch.py -- python3 python/fsrouter.py
+```
+
+The watcher polls `ROUTE_DIR` and restarts the server automatically when the
+discovered route tree changes, so adding, removing, renaming, or reclassifying
+handler files does not require a manual restart.
 
 ## Project goal
 

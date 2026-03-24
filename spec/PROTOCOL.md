@@ -1,6 +1,6 @@
 # fsrouter Protocol Specification
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 
 This document defines the behavior of a conforming fsrouter implementation. It is
 the authoritative reference — when an implementation disagrees with this document,
@@ -339,6 +339,29 @@ These variables configure the server itself. They are read once at startup.
 | `LISTEN_ADDR` | `:8080` | Bind address in `host:port` or `:port` form |
 | `COMMAND_TIMEOUT` | `30` | Handler timeout in seconds |
 
+#### 7.1.1. Listen address forms
+
+Implementations MUST accept the following `LISTEN_ADDR` forms:
+
+- `:8080` — bind to port `8080` on all interfaces.
+- `127.0.0.1:8080` — bind only to the IPv4 loopback interface.
+- `0.0.0.0:8080` — bind to all IPv4 interfaces explicitly.
+- `[::1]:8080` — bind only to the IPv6 loopback interface.
+- `[::]:8080` — bind to all IPv6 interfaces explicitly.
+
+More generally:
+
+- `host:port` binds to the specified host and port.
+- `:port` is shorthand for a wildcard bind on that port.
+- `[ipv6-literal]:port` is the required bracketed form for IPv6 literals.
+
+For this specification, "all interfaces" means the wildcard or unspecified
+address for the chosen socket family. A server started with `:8080`,
+`0.0.0.0:8080`, or `[::]:8080` is intended to accept requests from beyond the
+local machine, subject to the operating system, firewall, and network policy.
+A server started with `127.0.0.1:8080` or `[::1]:8080` is intended to accept
+requests only from the local machine.
+
 ### 7.2. Request variables
 
 These variables are set for every handler subprocess invocation. They do not
@@ -495,13 +518,55 @@ On receiving `SIGINT` or `SIGTERM` (or platform equivalent), the server:
 
 ---
 
-## 11. Non-Requirements
+## 11. Optional Capabilities
+
+### 11.1. Automatic route reloading
+
+An implementation MAY support automatic reloading of the discovered route tree
+after filesystem changes. This capability MAY be implemented either inside the
+server process or by a supervising wrapper that restarts the server
+automatically.
+
+If an implementation or wrapper advertises automatic reloading, it MUST:
+
+1. Detect changes that would alter the startup-discovered route tree, without
+   requiring manual operator action.
+2. Re-run route discovery after those changes.
+3. Apply the updated route tree to subsequent requests.
+
+Changes that alter the discovered route tree include, at minimum:
+
+- Creating, deleting, renaming, or moving method files.
+- Changing whether a method file is executable.
+- Creating, deleting, renaming, or moving directories or symlinks that affect
+  a registered route path.
+
+Implementations MAY watch more broadly and reload on any change beneath
+`ROUTE_DIR`, even if some of those changes would not strictly require a reload.
+
+After a successful reload:
+
+- New requests MUST use the newly discovered route tree.
+- In-flight requests MAY complete against the previously active route tree.
+- The implementation SHOULD log the refreshed route table using the same format
+  as startup logging (§3.3).
+
+If a reload attempt fails, the implementation SHOULD log a diagnostic message.
+It MAY either continue serving the last known-good route tree or, in a
+wrapper-restart design, briefly stop accepting requests until the server is
+running again. The important property is that no manual restart is required.
+
+Base conformance does not require automatic reloading. It is an optional,
+standardized capability.
+
+---
+
+## 12. Non-Requirements
 
 The following are explicitly out of scope for a conforming implementation:
 
 - **HTTPS / TLS termination.** Use a reverse proxy.
 - **WebSocket or streaming responses.** Handler output is buffered.
-- **Hot reloading.** The route tree is built once at startup.
 - **Request body size limits.** Handlers are responsible for their own input
   validation.
 - **Authentication, authorization, CORS, rate limiting, or any middleware.**
@@ -514,10 +579,13 @@ The following are explicitly out of scope for a conforming implementation:
 
 ---
 
-## 12. Compliance Checklist
+## 13. Compliance Checklist
 
 An implementation is conforming if it passes all of the following behavioral
 tests. Each test corresponds to an entry in `spec/test-suite/tests/`.
+
+The base compliance suite covers the required behavior in Sections 1-10 and
+does not currently test the optional capability in Section 11.
 
 | # | Test | Requirement |
 |---|------|-------------|
