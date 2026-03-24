@@ -232,17 +232,26 @@ func (s *server) serveFilesystem(w http.ResponseWriter, r *http.Request, segs []
 		return 404
 	}
 	if !info.IsDir() {
-		http.ServeFile(w, r, fullPath)
-		return 200
+		return s.serveFallbackFile(w, r, fullPath)
 	}
 	if kind, indexPath, ok := findDirectoryIndex(fullPath); ok {
-		if kind == "static" {
-			http.ServeFile(w, r, indexPath)
-			return 200
-		}
-		return s.handle(w, r, indexPath, map[string]string{})
+		_ = kind
+		return s.serveFallbackFile(w, r, indexPath)
 	}
 	return s.serveDirListing(w, r, fullPath)
+}
+
+func (s *server) serveFallbackFile(w http.ResponseWriter, r *http.Request, path string) int {
+	info, err := os.Stat(path)
+	if err != nil {
+		writeJSON(w, 500, `{"error":"handler_stat_failed","message":%q}`, err.Error())
+		return 500
+	}
+	if info.Mode()&0111 != 0 {
+		return s.executePlainFile(w, r, path)
+	}
+	http.ServeFile(w, r, path)
+	return 200
 }
 
 func (s *server) serveDirListing(w http.ResponseWriter, r *http.Request, dirPath string) int {
@@ -335,6 +344,51 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request, path string, par
 	}
 
 	return writeCGIResponse(w, body, exitCode)
+}
+
+func (s *server) executePlainFile(w http.ResponseWriter, r *http.Request, path string) int {
+	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, path)
+	cmd.Dir = filepath.Dir(path)
+	cmd.Stdin = r.Body
+	cmd.Env = buildEnv(r, map[string]string{})
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+
+	exitCode := 0
+	if runErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			writeJSON(w, 504, `{"error":"handler_timeout","timeout_seconds":%d}`,
+				int(s.timeout.Seconds()))
+			return 504
+		}
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			writeJSON(w, 502, `{"error":"exec_failed","message":%q}`, runErr.Error())
+			return 502
+		}
+	}
+
+	if stderr.Len() > 0 {
+		log.Printf("  [handler stderr] %s", strings.TrimRight(stderr.String(), "\n"))
+	}
+
+	body := stdout.Bytes()
+	status := exitToStatus(exitCode)
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	if r.Method != "HEAD" {
+		w.Write(body)
+	}
+	return status
 }
 
 // ---------------------------------------------------------------------------

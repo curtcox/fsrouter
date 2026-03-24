@@ -461,6 +461,19 @@ printf '{\"done\":true}'"""))
                 self.assertIn("text/plain", headers.get_content_type())
                 self.assertEqual(body.decode("utf-8"), "hello from notes")
 
+    def test_executable_file_in_route_dir_is_run_as_text_plain(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            tools = routes / "tools"
+            tools.mkdir()
+            (tools / "value.txt").write_text("from-exec-file", encoding="utf-8")
+            self.write_handler(routes, "tools/report.txt", self.shell("""cat value.txt"""))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, headers, body = server.request("GET", "/tools/report.txt")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get_content_type(), "text/plain")
+                self.assertEqual(body.decode("utf-8"), "from-exec-file")
+
     def test_directory_in_route_dir_returns_html_listing(self):
         with self.make_routes() as temp_dir:
             routes = Path(temp_dir)
@@ -508,8 +521,8 @@ printf '{\"done\":true}'"""))
             with RunningServer(self.command, self.command_cwd, routes) as server:
                 status, headers, body = server.request("GET", "/docs")
                 self.assertEqual(status, 200)
-                self.assertEqual(headers.get_content_type(), "application/json")
-                self.assertEqual(self.parse_json(body), {"source": "exec"})
+                self.assertEqual(headers.get_content_type(), "text/plain")
+                self.assertEqual(body.decode("utf-8"), '{"source":"exec"}')
 
     def test_directory_executable_index_runs_in_its_directory(self):
         with self.make_routes() as temp_dir:

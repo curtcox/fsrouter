@@ -156,23 +156,20 @@ class Handler(BaseHTTPRequestHandler):
     def serve_filesystem_fallback(self, segs: list[str], request_path: str) -> int:
         fallback = self.server.route_dir_abs.joinpath(*segs) if segs else self.server.route_dir_abs
         if fallback.is_file():
-            return self.serve_static(fallback)
+            return self.serve_fallback_file(fallback)
         if fallback.is_dir():
             preferred = self.find_directory_index(fallback)
             if preferred is not None:
-                kind, path = preferred
-                if kind == "static":
-                    return self.serve_static(path)
-                return self.handle_handler(path, {})
+                return self.serve_fallback_file(preferred)
             return self.serve_dir_listing(fallback, request_path)
         self.write_json(404, {"error": "not_found", "path": request_path})
         return 404
 
-    def find_directory_index(self, dir_path: Path) -> Optional[tuple[str, Path]]:
+    def find_directory_index(self, dir_path: Path) -> Optional[Path]:
         for name in ("index.html", "index.htm"):
             path = dir_path / name
             if path.is_file():
-                return ("static", path)
+                return path
         executable_indexes: list[Path] = []
         try:
             for entry in dir_path.iterdir():
@@ -183,8 +180,57 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return None
         if executable_indexes:
-            return ("exec", sorted(executable_indexes, key=lambda p: p.name)[0])
+            return sorted(executable_indexes, key=lambda p: p.name)[0]
         return None
+
+    def serve_fallback_file(self, path: Path) -> int:
+        try:
+            st = path.stat()
+        except OSError as err:
+            self.write_json(500, {"error": "handler_stat_failed", "message": str(err)})
+            return 500
+        if is_executable(st):
+            return self.execute_plain_file(path)
+        return self.serve_static(path)
+
+    def execute_plain_file(self, path: Path) -> int:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        request_body = self.rfile.read(length) if length > 0 else b""
+        env = build_env(self, {})
+
+        try:
+            proc = subprocess.Popen(
+                [str(path)],
+                cwd=str(path.parent),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+        except OSError as err:
+            self.write_json(502, {"error": "exec_failed", "message": str(err)})
+            return 502
+
+        try:
+            stdout, stderr = proc.communicate(request_body, timeout=self.server.command_timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.write_json(504, {"error": "handler_timeout", "timeout_seconds": self.server.command_timeout})
+            return 504
+
+        if stderr:
+            sys.stderr.write(f"  [handler stderr] {stderr.decode('utf-8', errors='replace').rstrip()}\n")
+            sys.stderr.flush()
+
+        status = exit_to_status(proc.returncode or 0)
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(stdout)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(stdout)
+        return status
 
     def serve_dir_listing(self, dir_path: Path, request_path: str) -> int:
         try:

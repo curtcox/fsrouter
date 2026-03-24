@@ -249,6 +249,76 @@ rescue StandardError => e
   500
 end
 
+def execute_plain_file(req, res, server, handler_path)
+  env = build_env(req, server, {})
+  body = req.body || ''
+  stdout = ''
+  stderr = ''
+  status = nil
+  wait_thr = nil
+  pid = nil
+
+  begin
+    Open3.popen3(env, handler_path, chdir: File.dirname(handler_path)) do |stdin, out, err, thr|
+      wait_thr = thr
+      pid = thr.pid
+      stdin.binmode
+      out.binmode
+      err.binmode
+      stdin.write(body)
+      stdin.close
+      begin
+        Timeout.timeout(server[:command_timeout]) do
+          stdout_reader = Thread.new { out.read }
+          stderr_reader = Thread.new { err.read }
+          status = thr.value
+          stdout = stdout_reader.value
+          stderr = stderr_reader.value
+        end
+      rescue Timeout::Error
+        begin
+          Process.kill('TERM', pid)
+        rescue StandardError
+        end
+        begin
+          Timeout.timeout(1) { thr.value }
+        rescue StandardError
+          begin
+            Process.kill('KILL', pid)
+          rescue StandardError
+          end
+        end
+        json_response(res, req, 504, { error: 'handler_timeout', timeout_seconds: server[:command_timeout] })
+        return 504
+      end
+    end
+  rescue Errno::ENOENT, Errno::EACCES => e
+    json_response(res, req, 502, { error: 'exec_failed', message: e.message })
+    return 502
+  end
+
+  unless stderr.empty?
+    $stderr.puts("  [handler stderr] #{stderr.encode('UTF-8', invalid: :replace, undef: :replace).rstrip}")
+    $stderr.flush
+  end
+
+  body_out = stdout
+  res.status = exit_to_status(status&.exitstatus || 0)
+  res['Content-Type'] = 'text/plain'
+  res['Content-Length'] = body_out.bytesize.to_s
+  res.body = req.request_method == 'HEAD' ? '' : body_out
+  res.status
+end
+
+def serve_fallback_file(req, res, server_config, path)
+  return execute_plain_file(req, res, server_config, path) if is_executable(path)
+
+  serve_static(req, res, path)
+rescue StandardError => e
+  json_response(res, req, 500, { error: 'handler_stat_failed', message: e.message })
+  500
+end
+
 def execute_handler(req, res, server, handler_path, params)
   env = build_env(req, server, params)
   body = req.body || ''
@@ -341,12 +411,11 @@ end
 def serve_filesystem_fallback(req, res, segs, route_dir_abs, server_config)
   fallback = File.join(route_dir_abs, *segs)
   if File.file?(fallback)
-    return serve_static(req, res, fallback)
+    return serve_fallback_file(req, res, server_config, fallback)
   elsif File.directory?(fallback)
     preferred = find_directory_index(fallback)
     if preferred
-      kind, path = preferred
-      return kind == :static ? serve_static(req, res, path) : handle_handler(req, res, server_config, path, {})
+      return serve_fallback_file(req, res, server_config, preferred)
     end
     return serve_dir_listing(req, res, fallback, req.path)
   end
@@ -357,14 +426,14 @@ end
 def find_directory_index(dir_path)
   %w[index.html index.htm].each do |name|
     path = File.join(dir_path, name)
-    return [:static, path] if File.file?(path)
+    return path if File.file?(path)
   end
   executable = Dir.children(dir_path)
                   .select { |name| name.start_with?('index.') }
                   .sort
                   .map { |name| File.join(dir_path, name) }
                   .find { |path| File.file?(path) && is_executable(path) }
-  executable ? [:exec, executable] : nil
+  executable || nil
 rescue StandardError
   nil
 end

@@ -450,19 +450,27 @@ int serveFilesystem(HttpExchange exchange, String method, Path routeDir, List<St
         return writeJson(exchange, method, 404, [error: 'not_found', path: rawPath])
     }
     if (Files.isRegularFile(fallback)) {
-        return serveStatic(exchange, method, fallback)
+        return serveFallbackFile(exchange, method, fallback, timeoutSeconds, listenAddr)
     }
     if (Files.isDirectory(fallback)) {
         Map preferred = findDirectoryIndex(fallback)
         if (preferred != null) {
-            if (preferred.kind == 'static') {
-                return serveStatic(exchange, method, preferred.path as Path)
-            }
-            return handleHandler(exchange, method, preferred.path as Path, [:], timeoutSeconds, listenAddr)
+            return serveFallbackFile(exchange, method, preferred.path as Path, timeoutSeconds, listenAddr)
         }
         return serveDirListing(exchange, method, fallback, rawPath)
     }
     return writeJson(exchange, method, 404, [error: 'not_found', path: rawPath])
+}
+
+int serveFallbackFile(HttpExchange exchange, String method, Path path, int timeoutSeconds, String listenAddr) {
+    try {
+        if (isExecutable(path)) {
+            return executePlainFile(exchange, method, path, timeoutSeconds, listenAddr)
+        }
+    } catch (IOException err) {
+        return writeJson(exchange, method, 500, [error: 'handler_stat_failed', message: err.message])
+    }
+    return serveStatic(exchange, method, path)
 }
 
 Map findDirectoryIndex(Path dirPath) {
@@ -616,6 +624,70 @@ int handleHandler(HttpExchange exchange, String method, Path handlerPath, Map<St
         raw = stderr
     }
     writeCgiResponse(exchange, method, raw, exitCode)
+}
+
+int executePlainFile(HttpExchange exchange, String method, Path handlerPath, int timeoutSeconds, String listenAddr) {
+    byte[] requestBody = readAllBytes(exchange.requestBody)
+    Map<String, String> env = buildEnv(new ExchangeContext(method: method, uri: exchange.requestURI, headers: exchange.requestHeaders, remoteAddress: exchange.remoteAddress, listenAddr: listenAddr), [:])
+
+    Process process
+    try {
+        ProcessBuilder builder = new ProcessBuilder(handlerPath.toString())
+        builder.directory(handlerPath.parent.toFile())
+        builder.environment().clear()
+        builder.environment().putAll(env)
+        process = builder.start()
+    } catch (IOException err) {
+        return writeJson(exchange, method, 502, [error: 'exec_failed', message: err.message])
+    }
+
+    ExecutorService ioExecutor = Executors.newFixedThreadPool(2)
+    Future<byte[]> stdoutFuture = ioExecutor.submit(readStream(process.inputStream))
+    Future<byte[]> stderrFuture = ioExecutor.submit(readStream(process.errorStream))
+    process.outputStream.withCloseable { OutputStream stdin ->
+        stdin.write(requestBody)
+    }
+
+    byte[] stdout
+    byte[] stderr
+    int exitCode
+    try {
+        boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            process.waitFor(1, TimeUnit.SECONDS)
+            stdoutFuture.cancel(true)
+            stderrFuture.cancel(true)
+            ioExecutor.shutdownNow()
+            return writeJson(exchange, method, 504, [error: 'handler_timeout', timeout_seconds: timeoutSeconds])
+        }
+        exitCode = process.exitValue()
+        stdout = stdoutFuture.get()
+        stderr = stderrFuture.get()
+    } catch (InterruptedException err) {
+        Thread.currentThread().interrupt()
+        process.destroyForcibly()
+        ioExecutor.shutdownNow()
+        return writeJson(exchange, method, 500, [error: 'exec_failed', message: err.message])
+    } catch (ExecutionException err) {
+        process.destroyForcibly()
+        ioExecutor.shutdownNow()
+        Throwable cause = err.cause == null ? err : err.cause
+        return writeJson(exchange, method, 500, [error: 'exec_failed', message: cause.message == null ? cause.toString() : cause.message])
+    } finally {
+        ioExecutor.shutdownNow()
+    }
+
+    if (stderr.length > 0) {
+        System.err.printf('  [handler stderr] %s%n', new String(stderr, StandardCharsets.UTF_8).replaceFirst(/[\r\n]+$/, ''))
+        System.err.flush()
+    }
+
+    Headers headers = exchange.responseHeaders
+    headers.set('Content-Type', 'text/plain')
+    headers.set('Content-Length', Integer.toString(stdout.length))
+    sendResponse(exchange, method, exitToStatus(exitCode), stdout)
+    exitToStatus(exitCode)
 }
 
 void logResult(String method, String path, int status, long startNanos) {

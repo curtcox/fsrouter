@@ -570,6 +570,46 @@ serve_executable_fallback() {
   printf '%s' "$CGI_STATUS"
 }
 
+serve_executable_plain_file() {
+  local response_file="$1"
+  local handler_path="$2"
+  local request_body_file="$3"
+  local request_method="$4"
+  local request_target="$5"
+  local request_path="$6"
+  local query_string="$7"
+  local content_type="$8"
+  local content_length="$9"
+  local peer="${10}"
+  local host_header="${11}"
+  local listen_addr="${12}"
+  local timeout_seconds="${13}"
+  run_handler "$handler_path" "$request_body_file" "$request_method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+  if (( HANDLER_EXIT_CODE == 142 || HANDLER_EXIT_CODE == 124 )); then
+    write_json_response_file "$response_file" "$request_method" 504 "{\"error\":\"handler_timeout\",\"timeout_seconds\":$timeout_seconds}"
+    rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+    printf '504'
+    return
+  fi
+  if (( HANDLER_EXIT_CODE == 127 )); then
+    write_json_response_file "$response_file" "$request_method" 502 '{"error":"exec_failed","message":"exec_failed"}'
+    rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+    printf '502'
+    return
+  fi
+  local extra_headers
+  extra_headers=$(mktemp)
+  : > "$extra_headers"
+  write_response_file "$response_file" "$request_method" "$(exit_to_status "$HANDLER_EXIT_CODE")" 'text/plain' "$HANDLER_STDOUT_FILE" "$extra_headers"
+  if [[ -s "$HANDLER_STDERR_FILE" ]]; then
+    local stderr_text
+    stderr_text=$(tr -d '\r' < "$HANDLER_STDERR_FILE" | tr '\n' ' ')
+    printf '  [handler stderr] %s\n' "$stderr_text" >&2
+  fi
+  rm -f "$extra_headers" "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
+  printf '%s' "$(exit_to_status "$HANDLER_EXIT_CODE")"
+}
+
 serve_dir_listing() {
   local response_file="$1"
   local method="$2"
@@ -624,17 +664,25 @@ serve_filesystem_fallback() {
   fi
   if [[ -d "$fallback" ]]; then
     if find_directory_index "$fallback"; then
+      if [[ -x "$DIRECTORY_INDEX_PATH" ]]; then
+        serve_executable_plain_file "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+        return
+      fi
       if [[ "$DIRECTORY_INDEX_KIND" == 'static' ]]; then
         serve_static "$response_file" "$method" "$DIRECTORY_INDEX_PATH"
         return
       fi
-      serve_executable_fallback "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+      serve_executable_plain_file "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
       return
     fi
     serve_dir_listing "$response_file" "$method" "$fallback" "$request_path"
     return
   fi
   if [[ -f "$fallback" ]]; then
+    if [[ -x "$fallback" ]]; then
+      serve_executable_plain_file "$response_file" "$fallback" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+      return
+    fi
     serve_static "$response_file" "$method" "$fallback"
     return
   fi

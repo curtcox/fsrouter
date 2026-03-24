@@ -504,6 +504,26 @@ sub serve_static {
     return 200;
 }
 
+sub execute_plain_file {
+    my ($client, $request, $handler_path, $timeout_seconds, $listen_addr) = @_;
+    my $env = build_env($request, {}, $listen_addr);
+    my $result = run_handler($handler_path, $request->{body}, $env, $timeout_seconds);
+    if ($result->{timed_out}) {
+        return write_json($client, $request->{method}, 504, { error => 'handler_timeout', timeout_seconds => $timeout_seconds });
+    }
+    if (!$result->{ok} && $result->{exit_code} == 127) {
+        return write_json($client, $request->{method}, 502, { error => 'exec_failed', message => $result->{reason} });
+    }
+    if ($result->{stderr} ne '') {
+        my $stderr = $result->{stderr};
+        $stderr =~ s/[\r\n]+$//;
+        print STDERR "  [handler stderr] $stderr\n";
+        STDERR->flush();
+    }
+    send_response($client, $request->{method}, exit_to_status($result->{exit_code}), { 'Content-Type' => 'text/plain' }, $result->{stdout});
+    return exit_to_status($result->{exit_code});
+}
+
 sub serve_dir_listing {
     my ($client, $method, $dir_path, $request_path) = @_;
     opendir(my $dh, $dir_path) or do {
@@ -552,11 +572,12 @@ sub serve_filesystem_fallback {
     $fallback = $abs_route_dir if !@{$segs};
     if (-d $fallback) {
         my ($kind, $candidate) = find_directory_index($fallback);
-        return serve_static($client, $request->{method}, $candidate) if defined($kind) && $kind eq 'static';
-        return handle_handler($client, $request, $candidate, {}, $timeout_seconds, $listen_addr) if defined($kind) && $kind eq 'exec';
+        return execute_plain_file($client, $request, $candidate, $timeout_seconds, $listen_addr) if defined($kind) && is_executable($candidate);
+        return serve_static($client, $request->{method}, $candidate) if defined($kind);
         return serve_dir_listing($client, $request->{method}, $fallback, $request->{path});
     }
     if (-f $fallback) {
+        return execute_plain_file($client, $request, $fallback, $timeout_seconds, $listen_addr) if is_executable($fallback);
         return serve_static($client, $request->{method}, $fallback);
     }
     return write_json($client, $request->{method}, 404, { error => 'not_found', path => $request->{path} });

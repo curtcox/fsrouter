@@ -578,6 +578,23 @@ local function serve_static(client, method, handler_path)
   return 200
 end
 
+local function execute_plain_file(client, request, handler_path, timeout_seconds, listen_addr)
+  local env = build_env(request, {}, listen_addr)
+  local result = run_handler(handler_path, request.body, env, timeout_seconds)
+  if result.timed_out then
+    return write_json(client, request.method, 504, { error = "handler_timeout", timeout_seconds = timeout_seconds })
+  end
+  if not result.ok and result.exit_code == 0 then
+    return write_json(client, request.method, 502, { error = "exec_failed", message = tostring(result.reason) })
+  end
+  if result.stderr ~= "" then
+    io.stderr:write("  [handler stderr] " .. result.stderr:gsub("[\r\n]+$", "") .. "\n")
+    io.stderr:flush()
+  end
+  send_response(client, request.method, exit_to_status(result.exit_code), { ["Content-Type"] = "text/plain" }, result.stdout)
+  return exit_to_status(result.exit_code)
+end
+
 local function is_dir(path)
   local process = io.popen("test -d " .. string.format("%q", path) .. " && printf 1 || printf 0", "r")
   if not process then return false end
@@ -653,15 +670,18 @@ local function serve_filesystem_fallback(client, request, segs, route_dir, timeo
   local fallback = table.concat(parts, "/")
   if is_dir(fallback) then
     local kind, candidate = find_directory_index(fallback)
-    if kind == "static" then
+    if kind then
+      if is_executable(candidate) then
+        return execute_plain_file(client, request, candidate, timeout_seconds, listen_addr)
+      end
       return serve_static(client, request.method, candidate)
-    end
-    if kind == "exec" then
-      return handle_handler(client, request, candidate, {}, timeout_seconds, listen_addr)
     end
     return serve_dir_listing(client, request.method, fallback, request.path)
   end
   if is_file(fallback) then
+    if is_executable(fallback) then
+      return execute_plain_file(client, request, fallback, timeout_seconds, listen_addr)
+    end
     return serve_static(client, request.method, fallback)
   end
   return write_json(client, request.method, 404, { error = "not_found", path = request.path })

@@ -135,10 +135,19 @@ serve the path directly from the filesystem before returning 404.
 1. Construct the candidate path by joining `ROUTE_DIR` with the normalized
    path segments. Because `..` segments are already rejected (§4.1), the
    result is guaranteed to remain within `ROUTE_DIR`.
-2. **Regular file** — if the candidate path is a regular file, serve it:
-   - Status: `200 OK`
-   - `Content-Type`: detected from the file extension (same logic as §5.2).
-   - Body: the raw file contents.
+2. **Regular file** — if the candidate path is a regular file:
+   - If the file is not executable, serve it:
+     - Status: `200 OK`
+     - `Content-Type`: detected from the file extension (same logic as §5.2).
+     - Body: the raw file contents.
+   - If the file is executable, execute it:
+     - The subprocess working directory is the file's parent directory.
+     - Invocation, environment, stdin delivery, and timeout handling follow the
+       executable handler rules in §5.3.
+     - The response status defaults from the exit code using the same mapping as
+       §5.3 (`0 -> 200`, `1 -> 400`, all others -> `500`).
+     - `Content-Type: text/plain`
+     - Body: the subprocess's stdout exactly, without CGI header parsing.
 3. **Directory** — if the candidate path is a directory:
    1. If `index.html` exists and is a regular file, serve that file exactly as
       in step 2.
@@ -146,8 +155,7 @@ serve the path directly from the filesystem before returning 404.
       exactly as in step 2.
    3. Otherwise, if one or more regular files whose names match `index.*` are
       present and executable, execute the lexicographically first such file
-      using the executable handler contract from §5.3. The subprocess working
-      directory is still the executable's parent directory (§5.3.2).
+      exactly as in the executable regular-file branch of step 2.
    4. Otherwise return a directory listing:
       - Status: `200 OK`
       - `Content-Type: text/html; charset=utf-8`
@@ -539,3 +547,5 @@ tests. Each test corresponds to an entry in `spec/test-suite/tests/`.
 | 24 | HTML directory index wins over executable `index.*` | §4.4 |
 | 25 | Executable `index.*` is run when no HTML index exists | §4.4, §5.3 |
 | 26 | Executable `index.*` runs with its parent directory as cwd | §4.4, §5.3.2 |
+| 27 | Executable filesystem fallback file is run and returned as `text/plain` | §4.4 |
+| 28 | Executable filesystem fallback file runs with its parent directory as cwd | §4.4 |

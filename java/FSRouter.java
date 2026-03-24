@@ -166,19 +166,23 @@ public class FSRouter {
             return writeJson(exchange, method, 404, jsonObject(Map.of("error", "not_found", "path", rawPath)));
         }
         if (Files.isRegularFile(fallback)) {
-            return serveStatic(exchange, method, fallback);
+            return serveFallbackFile(exchange, method, fallback, timeoutSeconds, listenAddr);
         }
         if (Files.isDirectory(fallback)) {
             DirectoryIndex preferred = findDirectoryIndex(fallback);
             if (preferred != null) {
-                if (preferred.kind.equals("static")) {
-                    return serveStatic(exchange, method, preferred.path);
-                }
-                return handleHandler(exchange, method, preferred.path, Map.of(), timeoutSeconds, listenAddr);
+                return serveFallbackFile(exchange, method, preferred.path, timeoutSeconds, listenAddr);
             }
             return serveDirListing(exchange, method, fallback, rawPath);
         }
         return writeJson(exchange, method, 404, jsonObject(Map.of("error", "not_found", "path", rawPath)));
+    }
+
+    private static int serveFallbackFile(HttpExchange exchange, String method, Path path, int timeoutSeconds, String listenAddr) throws IOException {
+        if (isExecutable(path)) {
+            return executePlainFile(exchange, method, path, timeoutSeconds, listenAddr);
+        }
+        return serveStatic(exchange, method, path);
     }
 
     private record DirectoryIndex(String kind, Path path) {}
@@ -319,6 +323,71 @@ public class FSRouter {
             raw = stderr;
         }
         return writeCgiResponse(exchange, method, raw, exitCode);
+    }
+
+    private static int executePlainFile(HttpExchange exchange, String method, Path handlerPath, int timeoutSeconds, String listenAddr) throws IOException {
+        byte[] requestBody = readAllBytes(exchange.getRequestBody());
+        ExchangeContext context = new ExchangeContext(method, exchange.getRequestURI(), exchange.getRequestHeaders(), exchange.getRemoteAddress(), listenAddr);
+        Map<String, String> env = buildEnv(context, Map.of());
+        ProcessBuilder builder = new ProcessBuilder(handlerPath.toString());
+        builder.directory(handlerPath.getParent().toFile());
+        builder.environment().clear();
+        builder.environment().putAll(env);
+
+        Process process;
+        try {
+            process = builder.start();
+        } catch (IOException e) {
+            return writeJson(exchange, method, 502, jsonObject(Map.of("error", "exec_failed", "message", e.getMessage())));
+        }
+
+        ExecutorService ioExecutor = Executors.newFixedThreadPool(2);
+        Future<byte[]> stdoutFuture = ioExecutor.submit(readStream(process.getInputStream()));
+        Future<byte[]> stderrFuture = ioExecutor.submit(readStream(process.getErrorStream()));
+        try (OutputStream stdin = process.getOutputStream()) {
+            stdin.write(requestBody);
+        }
+
+        byte[] stdout;
+        byte[] stderr;
+        int exitCode;
+        try {
+            boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                process.waitFor(1, TimeUnit.SECONDS);
+                stdoutFuture.cancel(true);
+                stderrFuture.cancel(true);
+                ioExecutor.shutdownNow();
+                return writeJson(exchange, method, 504, "{\"error\":\"handler_timeout\",\"timeout_seconds\":" + timeoutSeconds + "}");
+            }
+            exitCode = process.exitValue();
+            stdout = stdoutFuture.get();
+            stderr = stderrFuture.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+            ioExecutor.shutdownNow();
+            return writeJson(exchange, method, 500, jsonObject(Map.of("error", "exec_failed", "message", e.getMessage())));
+        } catch (ExecutionException e) {
+            process.destroyForcibly();
+            ioExecutor.shutdownNow();
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            return writeJson(exchange, method, 500, jsonObject(Map.of("error", "exec_failed", "message", cause.getMessage() == null ? cause.toString() : cause.getMessage())));
+        } finally {
+            ioExecutor.shutdownNow();
+        }
+
+        if (stderr.length > 0) {
+            System.err.printf("  [handler stderr] %s%n", new String(stderr, StandardCharsets.UTF_8).stripTrailing());
+            System.err.flush();
+        }
+
+        Headers headers = exchange.getResponseHeaders();
+        headers.set("Content-Type", "text/plain");
+        headers.set("Content-Length", Integer.toString(stdout.length));
+        sendResponse(exchange, method, exitToStatus(exitCode), stdout);
+        return exitToStatus(exitCode);
     }
 
     private static int serveStatic(HttpExchange exchange, String method, Path handlerPath) throws IOException {

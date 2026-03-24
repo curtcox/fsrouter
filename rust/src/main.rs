@@ -264,6 +264,95 @@ async fn handle_handler(
     cgi_response(raw, exit_code, parts.method == Method::HEAD)
 }
 
+async fn handle_plain_file(
+    state: &AppState,
+    parts: &Parts,
+    body: &Bytes,
+    remote_addr: SocketAddr,
+    path: &Path,
+) -> Response<Body> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"handler_stat_failed","message":err.to_string()}),
+            );
+        }
+    };
+
+    if !is_executable(&metadata) {
+        return serve_static(path, parts.method == Method::HEAD).await;
+    }
+
+    let mut command = Command::new(path);
+    command
+        .current_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    for (key, value) in build_env(parts, &BTreeMap::new(), remote_addr, &state.listen_addr) {
+        command.env(key, value);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":"exec_failed","message":err.to_string()}),
+            );
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(body).await;
+    }
+
+    let output = match timeout(state.timeout, child.wait_with_output()).await {
+        Ok(result) => match result {
+            Ok(output) => output,
+            Err(err) => {
+                return json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error":"exec_failed","message":err.to_string()}),
+                );
+            }
+        },
+        Err(_) => {
+            return json_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                json!({"error":"handler_timeout","timeout_seconds":state.timeout.as_secs()}),
+            );
+        }
+    };
+
+    if !output.stderr.is_empty() {
+        eprintln!(
+            "  [handler stderr] {}",
+            String::from_utf8_lossy(&output.stderr).trim_end_matches('\n')
+        );
+    }
+
+    let body_bytes = output.stdout;
+    let len = body_bytes.len();
+    let mut response = Response::new(if parts.method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(body_bytes)
+    });
+    *response.status_mut() = exit_to_status(output.status.code().unwrap_or(1));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+        response.headers_mut().insert("content-length", value);
+    }
+    response
+}
+
 async fn serve_static(path: &Path, suppress_body: bool) -> Response<Body> {
     let data = match tokio::fs::read(path).await {
         Ok(data) => data,
@@ -680,15 +769,11 @@ async fn serve_filesystem(
     let full_path: PathBuf = segs.iter().fold(route_dir.to_path_buf(), |acc, s| acc.join(s));
     match tokio::fs::metadata(&full_path).await {
         Err(_) => json_response(StatusCode::NOT_FOUND, json!({"error":"not_found","path":raw_path})),
-        Ok(meta) if meta.is_file() => serve_static(&full_path, parts.method == Method::HEAD).await,
+        Ok(meta) if meta.is_file() => handle_plain_file(state, parts, body, remote_addr, &full_path).await,
         Ok(_) => {
             if let Some((kind, path)) = find_directory_index(&full_path).await {
-                if kind == "static" {
-                    serve_static(&path, parts.method == Method::HEAD).await
-                } else {
-                    let params = BTreeMap::new();
-                    handle_handler(state, parts, body, remote_addr, &path, &params).await
-                }
+                let _ = kind;
+                handle_plain_file(state, parts, body, remote_addr, &path).await
             } else {
                 serve_dir_listing(&full_path, raw_path, parts.method == Method::HEAD).await
             }

@@ -424,6 +424,72 @@ async function executeHandler(handlerPath: string, request: Request, params: Rec
   return new Response(request.method === "HEAD" ? null : responseBody(body), { status: responseStatus, headers });
 }
 
+async function executePlainFile(handlerPath: string, request: Request, timeoutSeconds: number, remoteAddr: Deno.NetAddr | null, listenAddr: string): Promise<Response> {
+  const requestBody = new Uint8Array(await request.arrayBuffer());
+  const env = buildEnv(request, {}, remoteAddr, listenAddr);
+  const cwd = handlerPath.includes("/") ? handlerPath.slice(0, handlerPath.lastIndexOf("/")) : ".";
+
+  let child: Deno.ChildProcess;
+  try {
+    child = new Deno.Command(handlerPath, {
+      cwd,
+      env,
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+  } catch (error) {
+    return jsonResponse(502, { error: "exec_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
+  }
+
+  const stdinPromise = (async () => {
+    if (child.stdin) {
+      const writer = child.stdin.getWriter();
+      await writer.write(requestBody);
+      await writer.close();
+    }
+  })();
+
+  const stdoutPromise = child.stdout ? new Response(child.stdout).arrayBuffer().then((buf) => new Uint8Array(buf)) : Promise.resolve(new Uint8Array());
+  const stderrPromise = child.stderr ? new Response(child.stderr).arrayBuffer().then((buf) => new Uint8Array(buf)) : Promise.resolve(new Uint8Array());
+
+  let timedOut = false;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    const id = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+      clearTimeout(id);
+      reject(new Error("timeout"));
+    }, timeoutSeconds * 1000);
+  });
+
+  let status: Deno.CommandStatus;
+  let stdout: Uint8Array;
+  let stderr: Uint8Array;
+  try {
+    await stdinPromise;
+    status = await Promise.race([child.status, timeoutPromise]);
+    [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+  } catch (error) {
+    if (timedOut) {
+      return jsonResponse(504, { error: "handler_timeout", timeout_seconds: timeoutSeconds }, request.method);
+    }
+    return jsonResponse(500, { error: "exec_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
+  }
+
+  if (stderr.length > 0) {
+    console.error(`  [handler stderr] ${textDecoder.decode(stderr).replace(/\n$/, "")}`);
+  }
+
+  const headers = new Headers();
+  headers.set("content-type", "text/plain");
+  headers.set("content-length", String(stdout.length));
+  return new Response(request.method === "HEAD" ? null : responseBody(stdout), { status: exitToStatus(status.code), headers });
+}
+
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html", ".htm": "text/html",
   ".css": "text/css", ".js": "application/javascript",
@@ -491,16 +557,28 @@ async function serveFilesystem(
     return jsonResponse(404, { error: "not_found", path: requestPath }, request.method);
   }
   if (!info.isDirectory) {
-    return serveStatic(fullPath, request);
+    return serveFallbackFile(fullPath, info, request, timeoutSeconds, listenAddr, remoteAddr);
   }
   const preferred = await findDirectoryIndex(fullPath);
   if (preferred) {
-    if (preferred.kind === "static") {
-      return serveStatic(preferred.path, request);
-    }
-    return executeHandler(preferred.path, request, {}, timeoutSeconds, remoteAddr, listenAddr);
+    return serveFallbackFile(preferred.path, null, request, timeoutSeconds, listenAddr, remoteAddr);
   }
   return serveDirListing(fullPath, requestPath, request.method);
+}
+
+async function serveFallbackFile(
+  path: string,
+  info: Deno.FileInfo | null,
+  request: Request,
+  timeoutSeconds: number,
+  listenAddr: string,
+  remoteAddr: Deno.NetAddr | null,
+): Promise<Response> {
+  const fileInfo = info ?? await Deno.stat(path);
+  if (fileInfo.mode != null && (fileInfo.mode & 0o111) !== 0) {
+    return executePlainFile(path, request, timeoutSeconds, remoteAddr, listenAddr);
+  }
+  return serveStatic(path, request);
 }
 
 async function findDirectoryIndex(dirPath: string): Promise<{ kind: "static" | "exec"; path: string } | null> {
