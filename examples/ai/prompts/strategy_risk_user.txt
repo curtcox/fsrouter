@@ -1,6 +1,3 @@
-Server root:
-{{SERVER_ROOT}}
-
 Requested change:
 {{CHANGE_DESCRIPTION}}
 
@@ -19,13 +16,20 @@ Validation stdout:
 Validation stderr:
 {{VALIDATION_STDERR}}
 
-AI calls remaining after this step:
-{{AI_CALLS_REMAINING}}
+Planned strategy:
+Action: {{PLAN_ACTION}}
+Reason: {{PLAN_REASON}}
+
+Planned subchanges:
+{{PLAN_SUBCHANGES}}
 
 Recursion depth:
 {{RECURSION_DEPTH}}
 
-Visible file manifest:
-{{FILE_MANIFEST}}
+Context that informed the strategy:
+{{CONTEXT_BLOCKS}}
+
+AI calls remaining after this step:
+{{AI_CALLS_REMAINING}}
 
 Return only the JSON object.

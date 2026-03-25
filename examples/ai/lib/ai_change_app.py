@@ -23,6 +23,8 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = APP_ROOT / "data"
 CHANGES_ROOT = DATA_ROOT / "changes"
+LOGS_ROOT = APP_ROOT / "logs"
+AI_LOG_ROOT = LOGS_ROOT / "ai"
 PROMPT_ROOT = APP_ROOT / "prompts"
 DEFAULT_AI_BUDGET = 8
 DEFAULT_COMMAND_TIMEOUT = 120
@@ -34,11 +36,12 @@ MAX_CHANGE_FILES = 20
 MAX_RECURSION_DEPTH = 2
 MAX_VALIDATION_COMMAND_ATTEMPTS = 3
 MAX_VALIDATION_RISK_SCORE = 2.0
+DEFAULT_STRATEGY_RISK_THRESHOLD = 6.0
 MODEL_FETCH_TIMEOUT = 8
 CHAT_TIMEOUT = 60
 REFRESH_SECONDS = 3
 PROTECTED_PATH_PARTS = {".git"}
-PROTECTED_RELATIVE_PREFIXES = {"examples/ai/data/"}
+PROTECTED_RELATIVE_PREFIXES = {"examples/ai/data/", "examples/ai/logs/"}
 ALLOWED_VALIDATION_COMMANDS = (
     ("pytest",),
     ("go", "test"),
@@ -76,6 +79,16 @@ class BudgetExceededError(AppError):
     pass
 
 
+class RiskReviewRequired(AppError):
+    pass
+
+
+class OpenRouterChatError(AppError):
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = details
+
+
 @dataclass
 class CommandResult:
     command: str
@@ -104,6 +117,7 @@ def target_root() -> Path:
 def ensure_runtime_dirs() -> None:
     CHANGES_ROOT.mkdir(parents=True, exist_ok=True)
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    AI_LOG_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def utc_timestamp() -> str:
@@ -145,6 +159,10 @@ def append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def json_pretty(value) -> str:
+    return json.dumps(value, indent=2, sort_keys=True)
 
 
 def e(value: object) -> str:
@@ -292,6 +310,13 @@ def openrouter_headers() -> dict[str, str]:
     }
 
 
+def redacted_openrouter_headers() -> dict[str, str]:
+    headers = openrouter_headers()
+    if "Authorization" in headers:
+        headers["Authorization"] = "Bearer [redacted]"
+    return headers
+
+
 def flatten_openrouter_content(content) -> str:
     if isinstance(content, str):
         return content
@@ -347,7 +372,7 @@ def list_available_models() -> tuple[list[dict], str]:
     return models, ""
 
 
-def openrouter_chat(model: str, system_prompt: str, user_prompt: str) -> str:
+def openrouter_chat(model: str, system_prompt: str, user_prompt: str) -> dict:
     payload = {
         "model": model,
         "messages": [
@@ -363,25 +388,47 @@ def openrouter_chat(model: str, system_prompt: str, user_prompt: str) -> str:
         data=data,
         method="POST",
     )
+    details = {
+        "request": {
+            "method": "POST",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "headers": redacted_openrouter_headers(),
+            "json": payload,
+        }
+    }
     try:
         with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT) as response:
-            raw = json.loads(response.read().decode("utf-8"))
+            response_text = response.read().decode("utf-8")
+            raw = json.loads(response_text)
+            details["response"] = {
+                "status": response.status,
+                "headers": dict(response.headers.items()),
+                "body": response_text,
+                "json": raw,
+            }
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", errors="replace")
+        details["response"] = {
+            "status": err.code,
+            "headers": dict(err.headers.items()),
+            "body": detail,
+        }
         if err.code in (401, 403):
-            raise InvalidAPIKeyError("OpenRouter rejected the supplied API key.") from err
-        raise AppError(f"OpenRouter chat request failed with HTTP {err.code}: {detail}") from err
+            raise OpenRouterChatError("OpenRouter rejected the supplied API key.", details) from err
+        raise OpenRouterChatError(f"OpenRouter chat request failed with HTTP {err.code}: {detail}", details) from err
     except urllib.error.URLError as err:
-        raise AppError(f"Could not reach OpenRouter: {err.reason}") from err
+        details["response"] = {"error": str(err.reason)}
+        raise OpenRouterChatError(f"Could not reach OpenRouter: {err.reason}", details) from err
 
     choices = raw.get("choices") or []
     if not choices:
-        raise AppError("OpenRouter returned no choices.")
+        raise OpenRouterChatError("OpenRouter returned no choices.", details)
     message = choices[0].get("message", {})
     content = flatten_openrouter_content(message.get("content"))
     if not content:
-        raise AppError("OpenRouter returned an empty completion.")
-    return content
+        raise OpenRouterChatError("OpenRouter returned an empty completion.", details)
+    details["assistant_message"] = content
+    return details
 
 
 def strip_code_fences(text: str) -> str:
@@ -456,12 +503,15 @@ def build_file_manifest() -> str:
         dirnames[:] = [
             name
             for name in dirnames
-            if name not in ignored_dirs and f"{relative_root}/{name}".strip("/").lower() != "examples/ai/data"
+            if name not in ignored_dirs
+            and f"{relative_root}/{name}".strip("/").lower() not in {"examples/ai/data", "examples/ai/logs"}
         ]
         for filename in sorted(filenames):
             full_path = current_path / filename
             relative = full_path.relative_to(root).as_posix()
             if relative.lower().startswith("examples/ai/data/"):
+                continue
+            if relative.lower().startswith("examples/ai/logs/"):
                 continue
             try:
                 size = full_path.stat().st_size
@@ -614,6 +664,119 @@ def ai_calls_path_for(change_id: str) -> Path:
     return change_dir(change_id) / "ai_calls.jsonl"
 
 
+def ai_log_dir_for(change_id: str) -> Path:
+    return AI_LOG_ROOT / change_id
+
+
+def ai_log_path_for(change_id: str, call_id: str) -> Path:
+    return ai_log_dir_for(change_id) / f"{call_id}.json"
+
+
+def ai_call_url(change_id: str, call_id: str) -> str:
+    return route_url("/ai-call", change=change_id, call=call_id)
+
+
+def display_log_path(path: Path) -> str:
+    try:
+        return path.relative_to(APP_ROOT.parent.parent).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def served_app_url_for_path(path: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(APP_ROOT.resolve())
+    except ValueError:
+        return ""
+    return "/" + relative.as_posix()
+
+
+def served_app_path(value: str) -> str:
+    raw = str(value).strip()
+    if not raw or raw.startswith("/"):
+        return ""
+    try:
+        repo_relative = (APP_ROOT.parent.parent / raw).resolve()
+    except OSError:
+        return ""
+    return served_app_url_for_path(repo_relative)
+
+
+def direct_target_file_url(relative_path: str) -> str:
+    try:
+        return served_app_url_for_path(resolve_target_path(relative_path))
+    except AppError:
+        return ""
+
+
+def target_file_url(relative_path: str, *, start: int | None = None, end: int | None = None) -> str:
+    direct_url = direct_target_file_url(relative_path)
+    if direct_url:
+        return direct_url
+    return route_url("/file", path=relative_path, start=start, end=end)
+
+
+def default_result() -> dict:
+    return {
+        "context_items": [],
+        "applied_changes": [],
+        "attempted_changes": [],
+        "next_steps": [],
+        "decomposition": [],
+        "review": {},
+        "risk_assessments": [],
+    }
+
+
+def command_result_from_dict(payload: dict) -> CommandResult:
+    return CommandResult(
+        command=str(payload.get("command", "")),
+        exit_code=int(payload.get("exit_code", 0)),
+        stdout=str(payload.get("stdout", "")),
+        stderr=str(payload.get("stderr", "")),
+        duration_seconds=float(payload.get("duration_seconds", 0)),
+    )
+
+
+def latest_risk_assessment(result: dict) -> dict:
+    items = result.get("risk_assessments", [])
+    if isinstance(items, list) and items:
+        latest = items[-1]
+        if isinstance(latest, dict):
+            return latest
+    return {}
+
+
+def reset_result_for_retry(result: dict) -> dict:
+    fresh = default_result()
+    previous_assessments = result.get("risk_assessments", [])
+    if isinstance(previous_assessments, list) and previous_assessments:
+        fresh["risk_assessments"] = previous_assessments
+    return fresh
+
+
+def load_ai_calls(change_id: str) -> list[dict]:
+    items: list[dict] = []
+    path = ai_calls_path_for(change_id)
+    if not path.exists():
+        return items
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            items.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return items
+
+
+def load_ai_call_log(change_id: str, call_id: str) -> dict:
+    payload = read_json(ai_log_path_for(change_id, call_id), {})
+    if payload:
+        return payload
+    raise AppError("Unknown AI call log.")
+
+
 def load_request(change_id: str) -> dict:
     request = read_json(request_path_for(change_id), {})
     if not request:
@@ -626,7 +789,7 @@ def load_state(change_id: str) -> dict:
 
 
 def load_result(change_id: str) -> dict:
-    return read_json(result_path_for(change_id), {"context_items": [], "applied_changes": [], "attempted_changes": [], "next_steps": []})
+    return read_json(result_path_for(change_id), default_result())
 
 
 def save_state(change_id: str, state: dict) -> None:
@@ -671,6 +834,8 @@ def create_change_request(description: str, model: str, ai_budget: int, favorite
     request = {
         "id": change_id,
         "description": description,
+        "strategy_notes": "",
+        "allow_high_risk_strategy": False,
         "validation_command": "",
         "validation_command_source": "auto_generated",
         "model": model,
@@ -687,14 +852,7 @@ def create_change_request(description: str, model: str, ai_budget: int, favorite
         "ai_calls_used": 0,
         "error": "",
     }
-    result = {
-        "context_items": [],
-        "applied_changes": [],
-        "attempted_changes": [],
-        "next_steps": [],
-        "decomposition": [],
-        "review": {},
-    }
+    result = default_result()
     write_json_atomic(request_path_for(change_id), request)
     write_json_atomic(state_path_for(change_id), state)
     write_json_atomic(result_path_for(change_id), result)
@@ -749,6 +907,9 @@ class Workflow:
         self.budget_total = int(self.request["ai_budget"])
         self.ai_calls_used = int(self.state.get("ai_calls_used", 0))
 
+    def strategy_notes(self) -> str:
+        return str(self.request.get("strategy_notes", "")).strip()
+
     def persist(self) -> None:
         self.state["ai_calls_used"] = self.ai_calls_used
         self.state["updated_at"] = utc_timestamp()
@@ -781,21 +942,62 @@ class Workflow:
             raise BudgetExceededError("The configured AI call budget has been exhausted.")
         system_prompt = prompt_text(f"{stem}_system.txt", values)
         user_prompt = prompt_text(f"{stem}_user.txt", values)
-        raw_response = openrouter_chat(self.model, system_prompt, user_prompt)
+        call_number = self.ai_calls_used + 1
+        call_id = f"{call_number:03d}-{re.sub(r'[^a-z0-9]+', '-', stem.lower()).strip('-')}"
+        raw_response = ""
+        call_details: dict = {}
+        error_message = ""
+        try:
+            call_details = openrouter_chat(self.model, system_prompt, user_prompt)
+            raw_response = str(call_details.get("assistant_message", ""))
+        except OpenRouterChatError as err:
+            call_details = err.details
+            error_message = str(err)
+            if "rejected the supplied API key" in error_message.lower():
+                error_message = "OpenRouter rejected the supplied API key."
         self.ai_calls_used += 1
         self.persist()
+        log_record = {
+            "timestamp": utc_timestamp(),
+            "change_id": self.change_id,
+            "call_id": call_id,
+            "call_number": call_number,
+            "prompt": stem,
+            "model": self.model,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "assistant_message": raw_response,
+            "request": call_details.get("request", {}),
+            "response": call_details.get("response", {}),
+            "log_path": display_log_path(ai_log_path_for(self.change_id, call_id)),
+        }
+        if error_message:
+            log_record["error"] = error_message
+        write_json_atomic(ai_log_path_for(self.change_id, call_id), log_record)
         append_jsonl(
             ai_calls_path_for(self.change_id),
             {
-                "timestamp": utc_timestamp(),
+                "timestamp": log_record["timestamp"],
+                "call_id": call_id,
+                "call_number": call_number,
                 "prompt": stem,
                 "model": self.model,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "response": raw_response,
+                "assistant_message": raw_response,
+                "log_path": log_record["log_path"],
+                "url": ai_call_url(self.change_id, call_id),
+                "error": error_message,
             },
         )
-        return extract_json(raw_response)
+        if error_message:
+            if "rejected the supplied api key" in error_message.lower():
+                raise InvalidAPIKeyError(error_message)
+            raise AppError(error_message)
+        payload = extract_json(raw_response)
+        if isinstance(payload, dict):
+            payload["__ai_call_id"] = call_id
+            payload["__ai_call_url"] = ai_call_url(self.change_id, call_id)
+            payload["__ai_log_path"] = log_record["log_path"]
+        return payload
 
     def _validation_generation_rejections(self, attempts: list[dict]) -> str:
         lines: list[str] = []
@@ -807,20 +1009,16 @@ class Workflow:
             lines.append(f"- Attempt {item.get('attempt')}: {command} -> {reason}")
         return "\n".join(lines) if lines else "(none)"
 
-    def _score_validation_command_risk(self, command: str, generation_reason: str, attempt: int, attempts: list[dict]) -> tuple[float, str, list[str]]:
-        payload = self.ai_json(
-            "validation_risk",
-            {
-                "CHANGE_DESCRIPTION": self.request["description"],
-                "VALIDATION_COMMAND": command,
-                "GENERATION_REASON": generation_reason or "(none provided)",
-                "SERVER_ROOT": str(target_root()),
-                "ATTEMPT_NUMBER": str(attempt),
-                "MAX_ATTEMPTS": str(MAX_VALIDATION_COMMAND_ATTEMPTS),
-                "PREVIOUS_REJECTIONS": self._validation_generation_rejections(attempts),
-                "AI_CALLS_REMAINING": str(self.remaining_budget()),
-            },
-        )
+    def _string_list(self, raw_items, *, limit: int = 8) -> list[str]:
+        items: list[str] = []
+        if isinstance(raw_items, list):
+            for item in raw_items[:limit]:
+                text = str(item).strip()
+                if text:
+                    items.append(text)
+        return items
+
+    def _score_validation_command_risk(self, payload: dict) -> tuple[float, str, list[str]]:
         raw_score = payload.get("risk_score", payload.get("score"))
         if isinstance(raw_score, str):
             raw_score = raw_score.strip()
@@ -831,14 +1029,69 @@ class Workflow:
         if risk_score < 0 or risk_score > 10:
             raise AppError(f"Validation risk score must be between 0 and 10, got {risk_score}.")
         summary = str(payload.get("summary", payload.get("reason", ""))).strip()
-        concerns_raw = payload.get("concerns", [])
-        concerns: list[str] = []
-        if isinstance(concerns_raw, list):
-            for item in concerns_raw[:8]:
-                text = str(item).strip()
-                if text:
-                    concerns.append(text)
+        concerns = self._string_list(payload.get("concerns", []))
         return risk_score, summary, concerns
+
+    def assess_strategy_risk(
+        self,
+        description: str,
+        validation_before: CommandResult,
+        context_items: list[dict],
+        plan: dict,
+        depth: int,
+    ) -> dict:
+        subchange_lines: list[str] = []
+        raw_subchanges = plan.get("subchanges", [])
+        if isinstance(raw_subchanges, list):
+            for item in raw_subchanges[:3]:
+                sub_description = str(item.get("description", "")).strip()
+                title = str(item.get("title", "")).strip()
+                if title and sub_description:
+                    subchange_lines.append(f"- {title}: {sub_description}")
+                elif sub_description:
+                    subchange_lines.append(f"- {sub_description}")
+        payload = self.ai_json(
+            "strategy_risk",
+            {
+                "CHANGE_DESCRIPTION": description,
+                "STRATEGY_NOTES": self.strategy_notes() or "(none)",
+                "VALIDATION_COMMAND": validation_before.command,
+                "VALIDATION_EXIT_CODE": str(validation_before.exit_code),
+                "VALIDATION_STDOUT": validation_before.stdout or "(empty)",
+                "VALIDATION_STDERR": validation_before.stderr or "(empty)",
+                "PLAN_ACTION": str(plan.get("action", "implement")).strip() or "implement",
+                "PLAN_REASON": str(plan.get("reason", "")).strip() or "(none provided)",
+                "PLAN_SUBCHANGES": "\n".join(subchange_lines) or "(none)",
+                "CONTEXT_BLOCKS": render_context_blocks(context_items),
+                "AI_CALLS_REMAINING": str(self.remaining_budget()),
+                "RECURSION_DEPTH": str(depth),
+            },
+        )
+        risk_score, summary, concerns = self._score_validation_command_risk(payload)
+        bypass_strategies = self._string_list(payload.get("bypass_strategies", payload.get("alternatives", [])))
+        assessment = {
+            "created_at": utc_timestamp(),
+            "description": description,
+            "depth": depth,
+            "threshold": DEFAULT_STRATEGY_RISK_THRESHOLD,
+            "risk_score": round(risk_score, 2),
+            "summary": summary,
+            "concerns": concerns,
+            "bypass_strategies": bypass_strategies,
+            "plan_action": str(plan.get("action", "implement")).strip() or "implement",
+            "plan_reason": str(plan.get("reason", "")).strip(),
+            "plan_subchanges": raw_subchanges if isinstance(raw_subchanges, list) else [],
+            "strategy_notes": self.strategy_notes(),
+            "ai_call_id": payload.get("__ai_call_id", ""),
+            "status": "accepted" if risk_score <= DEFAULT_STRATEGY_RISK_THRESHOLD else "needs_user_review",
+        }
+        self.result.setdefault("risk_assessments", []).append(assessment)
+        self.persist()
+        self.log(
+            f"Strategy risk assessment scored {risk_score:.2f} at depth {depth}"
+            + (" and requires user review." if risk_score > DEFAULT_STRATEGY_RISK_THRESHOLD else ".")
+        )
+        return assessment
 
     def generate_validation_command(self) -> CommandResult:
         generation = {
@@ -870,6 +1123,7 @@ class Workflow:
                 "attempt": attempt,
                 "candidate_command": command,
                 "generator_reason": generator_reason,
+                "generator_ai_call_id": payload.get("__ai_call_id", ""),
             }
             issue = validation_command_allowlist_issue(command)
             if issue:
@@ -880,9 +1134,23 @@ class Workflow:
                 self.log(f"Rejected generated validation command attempt {attempt}: {issue}", level="error")
                 continue
 
-            risk_score, risk_summary, risk_concerns = self._score_validation_command_risk(command, generator_reason, attempt, attempts)
+            risk_payload = self.ai_json(
+                "validation_risk",
+                {
+                    "CHANGE_DESCRIPTION": self.request["description"],
+                    "VALIDATION_COMMAND": command,
+                    "GENERATION_REASON": generator_reason or "(none provided)",
+                    "SERVER_ROOT": str(target_root()),
+                    "ATTEMPT_NUMBER": str(attempt),
+                    "MAX_ATTEMPTS": str(MAX_VALIDATION_COMMAND_ATTEMPTS),
+                    "PREVIOUS_REJECTIONS": self._validation_generation_rejections(attempts),
+                    "AI_CALLS_REMAINING": str(self.remaining_budget()),
+                },
+            )
+            risk_score, risk_summary, risk_concerns = self._score_validation_command_risk(risk_payload)
             attempt_record["risk_score"] = round(risk_score, 2)
             attempt_record["risk_summary"] = risk_summary
+            attempt_record["risk_ai_call_id"] = risk_payload.get("__ai_call_id", "")
             if risk_concerns:
                 attempt_record["risk_concerns"] = risk_concerns
             if risk_score > MAX_VALIDATION_RISK_SCORE:
@@ -896,6 +1164,14 @@ class Workflow:
 
             preflight = run_check_command(command)
             attempt_record["preflight_result"] = preflight.to_dict()
+            issue = validation_command_runtime_issue(command, preflight)
+            if issue:
+                attempt_record["accepted"] = False
+                attempt_record["rejection_reason"] = issue
+                attempts.append(attempt_record)
+                self.persist()
+                self.log(f"Rejected generated validation command attempt {attempt}: {issue}", level="error")
+                continue
             if preflight.exit_code == 0:
                 issue = "Preflight passed before edits; command is not specific enough to validate the requested change."
                 attempt_record["accepted"] = False
@@ -911,6 +1187,8 @@ class Workflow:
             generation["accepted_risk_score"] = round(risk_score, 2)
             generation["accepted_risk_summary"] = risk_summary
             generation["accepted_preflight"] = preflight.to_dict()
+            generation["accepted_ai_call_id"] = attempt_record["generator_ai_call_id"]
+            generation["accepted_risk_ai_call_id"] = attempt_record["risk_ai_call_id"]
             self.request["validation_command"] = command
             self.request["validation_command_source"] = "generated"
             self.persist_request()
@@ -932,6 +1210,7 @@ class Workflow:
             "context_selector",
             {
                 "CHANGE_DESCRIPTION": description,
+                "STRATEGY_NOTES": self.strategy_notes() or "(none)",
                 "VALIDATION_COMMAND": validation_before.command,
                 "VALIDATION_EXIT_CODE": str(validation_before.exit_code),
                 "VALIDATION_STDOUT": validation_before.stdout or "(empty)",
@@ -943,6 +1222,7 @@ class Workflow:
             },
         )
         raw_items = payload.get("context", [])
+        call_id = str(payload.get("__ai_call_id", "")).strip()
         if not isinstance(raw_items, list) or not raw_items:
             raise AppError("The AI did not return any usable context references.")
 
@@ -967,7 +1247,8 @@ class Workflow:
                     "start_line": line_start,
                     "end_line": line_end,
                     "content": content,
-                    "file_url": route_url("/file", path=path, start=line_start, end=line_end),
+                    "file_url": target_file_url(path),
+                    "ai_call_id": call_id,
                 }
             )
         if not selected:
@@ -978,10 +1259,11 @@ class Workflow:
         return selected
 
     def plan(self, description: str, validation_before: CommandResult, context_items: list[dict], depth: int) -> dict:
-        return self.ai_json(
+        plan = self.ai_json(
             "plan_change",
             {
                 "CHANGE_DESCRIPTION": description,
+                "STRATEGY_NOTES": self.strategy_notes() or "(none)",
                 "VALIDATION_COMMAND": validation_before.command,
                 "VALIDATION_EXIT_CODE": str(validation_before.exit_code),
                 "VALIDATION_STDOUT": validation_before.stdout or "(empty)",
@@ -991,12 +1273,16 @@ class Workflow:
                 "RECURSION_DEPTH": str(depth),
             },
         )
+        if isinstance(plan, dict):
+            plan["__ai_call_id"] = str(plan.get("__ai_call_id", "")).strip()
+        return plan
 
     def implement(self, description: str, validation_before: CommandResult, context_items: list[dict], depth: int) -> list[dict]:
         payload = self.ai_json(
             "implement_change",
             {
                 "CHANGE_DESCRIPTION": description,
+                "STRATEGY_NOTES": self.strategy_notes() or "(none)",
                 "VALIDATION_COMMAND": validation_before.command,
                 "VALIDATION_EXIT_CODE": str(validation_before.exit_code),
                 "VALIDATION_STDOUT": validation_before.stdout or "(empty)",
@@ -1006,6 +1292,7 @@ class Workflow:
                 "RECURSION_DEPTH": str(depth),
             },
         )
+        call_id = str(payload.get("__ai_call_id", "")).strip()
         raw_changes = payload.get("changes", [])
         if not isinstance(raw_changes, list) or not raw_changes:
             raise AppError("The AI did not propose any file changes.")
@@ -1056,6 +1343,7 @@ class Workflow:
                     "before_content": before_content,
                     "after_content": after_content,
                     "diff": diff_text,
+                    "ai_call_id": call_id,
                 }
             )
         return prepared
@@ -1068,6 +1356,7 @@ class Workflow:
             "review_change",
             {
                 "CHANGE_DESCRIPTION": description,
+                "STRATEGY_NOTES": self.strategy_notes() or "(none)",
                 "VALIDATION_COMMAND": validation_before.command,
                 "VALIDATION_EXIT_CODE": str(validation_before.exit_code),
                 "VALIDATION_STDOUT": validation_before.stdout or "(empty)",
@@ -1080,7 +1369,7 @@ class Workflow:
         approved = bool(payload.get("approved"))
         issues = payload.get("issues", [])
         summary = str(payload.get("summary", "")).strip()
-        review = {"approved": approved, "summary": summary, "issues": issues}
+        review = {"approved": approved, "summary": summary, "issues": issues, "ai_call_id": payload.get("__ai_call_id", "")}
         self.result["review"] = review
         self.persist()
         return review
@@ -1104,6 +1393,7 @@ class Workflow:
             },
         )
         steps = payload.get("next_steps", [])
+        call_id = str(payload.get("__ai_call_id", "")).strip()
         normalized: list[dict] = []
         if isinstance(steps, list):
             for item in steps[:5]:
@@ -1115,6 +1405,7 @@ class Workflow:
                         "description": description,
                         "check_command": str(item.get("check_command", self.request["validation_command"])).strip(),
                         "why": str(item.get("why", "")).strip(),
+                        "ai_call_id": call_id,
                     }
                 )
         self.result["next_steps"] = normalized
@@ -1162,8 +1453,54 @@ def prepared_change_for_result(item: dict) -> dict:
         "path": item["path"],
         "description": item["description"],
         "diff": item["diff"],
-        "file_url": route_url("/file", path=item["path"]),
+        "file_url": target_file_url(item["path"]),
+        "ai_call_id": item.get("ai_call_id", ""),
     }
+
+
+def validation_command_runtime_issue(command: str, preflight: CommandResult) -> str:
+    stderr = (preflight.stderr or "").strip()
+    lowered = stderr.lower()
+    executable = ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if parts:
+        executable = parts[0]
+
+    if preflight.exit_code in {126, 127}:
+        if executable:
+            return f"Executable not found or not runnable for validation command: {executable}"
+        return "Validation command could not be executed in this environment."
+
+    runtime_markers = (
+        "command not found",
+        "no such file or directory",
+        "permission denied",
+        "operation not permitted",
+        "not recognized as an internal or external command",
+    )
+    if any(marker in lowered for marker in runtime_markers):
+        if executable:
+            return f"Executable not found or not runnable for validation command: {executable}"
+        return f"Validation command could not be executed: {stderr or 'runtime lookup failure'}"
+    return ""
+
+
+def process_change_contract_issues(item: dict) -> list[str]:
+    issues: list[str] = []
+    if item["path"] != "examples/ai/bin/process_change.py":
+        return issues
+    if item["action"] == "delete":
+        issues.append("Refusing to delete critical process_change entrypoint: examples/ai/bin/process_change.py")
+        return issues
+    after_content = item.get("after_content", "") or ""
+    if 'if len(sys.argv) != 2:' not in after_content:
+        issues.append("Refusing to remove required change-id CLI contract from examples/ai/bin/process_change.py")
+    if 'worker_main(sys.argv[1])' not in after_content:
+        issues.append("Refusing to remove worker_main invocation from examples/ai/bin/process_change.py")
+    return issues
 
 
 def local_review_issues(prepared_changes: list[dict]) -> list[str]:
@@ -1174,20 +1511,55 @@ def local_review_issues(prepared_changes: list[dict]) -> list[str]:
             issues.append(f"Refusing to modify repository metadata: {item['path']}")
         if path.startswith("examples/ai/data/"):
             issues.append(f"Refusing to modify runtime data: {item['path']}")
+        if path.startswith("examples/ai/logs/"):
+            issues.append(f"Refusing to modify runtime logs: {item['path']}")
+        issues.extend(process_change_contract_issues(item))
     return issues
 
 
-def execute_change_scope(workflow: Workflow, description: str, validation_before: CommandResult, depth: int, applied_changes: list[dict]) -> list[dict]:
-    workflow.set_step(f"Gathering context for depth {depth}")
-    context_items = workflow.choose_context(description, validation_before, depth)
+def review_rejection_message(review: dict, local_issues: list[str]) -> str:
+    summary = str(review.get("summary", "")).strip() or "The proposed changes were not approved during review."
+    issues = list(review.get("issues", []))
+    if local_issues:
+        issues.extend(local_issues)
+    if not issues:
+        return summary
+    return summary + "\n\nReview issues:\n- " + "\n- ".join(str(issue).strip() for issue in issues if str(issue).strip())
 
-    workflow.set_step(f"Planning change for depth {depth}")
-    plan = workflow.plan(description, validation_before, context_items, depth)
+
+def queue_change_retry(change_id: str, request: dict, state: dict, result: dict, *, message: str) -> None:
+    request["validation_command"] = ""
+    request["validation_command_source"] = "auto_generated"
+    save_request(change_id, request)
+    state["status"] = "queued"
+    state["current_step"] = "Queued"
+    state["error"] = ""
+    state["updated_at"] = utc_timestamp()
+    state.pop("completed_at", None)
+    save_state(change_id, state)
+    save_result(change_id, reset_result_for_retry(result))
+    append_event(change_id, message)
+
+
+def execute_planned_scope(
+    workflow: Workflow,
+    description: str,
+    validation_before: CommandResult,
+    depth: int,
+    applied_changes: list[dict],
+    context_items: list[dict],
+    plan: dict,
+) -> list[dict]:
     action = str(plan.get("action", "implement")).strip().lower()
     if action == "decompose" and depth < MAX_RECURSION_DEPTH:
         subchanges = plan.get("subchanges", [])
         if isinstance(subchanges, list) and 1 < len(subchanges) <= 3 and workflow.remaining_budget() >= len(subchanges) * 2:
-            decomposition_record = {"description": description, "subchanges": subchanges, "depth": depth}
+            decomposition_record = {
+                "description": description,
+                "subchanges": subchanges,
+                "depth": depth,
+                "ai_call_id": plan.get("__ai_call_id", ""),
+            }
             workflow.result.setdefault("decomposition", []).append(decomposition_record)
             workflow.persist()
             collected: list[dict] = []
@@ -1209,10 +1581,12 @@ def execute_change_scope(workflow: Workflow, description: str, validation_before
     if local_issues:
         review_issues = list(review_issues) + local_issues
         review["issues"] = review_issues
+    if local_issues or not review.get("approved"):
+        rejection_message = review_rejection_message(review, local_issues)
+        review["rejection_message"] = rejection_message
         workflow.result["review"] = review
         workflow.persist()
-    if local_issues or not review.get("approved"):
-        raise AppError("The proposed changes were not approved during review.")
+        raise AppError(rejection_message)
     workflow.set_step(f"Applying approved changes for depth {depth}")
     apply_prepared_changes(prepared)
     applied_changes.extend(prepared)
@@ -1222,9 +1596,120 @@ def execute_change_scope(workflow: Workflow, description: str, validation_before
     return prepared
 
 
+def execute_change_scope(workflow: Workflow, description: str, validation_before: CommandResult, depth: int, applied_changes: list[dict]) -> list[dict]:
+    workflow.set_step(f"Gathering context for depth {depth}")
+    context_items = workflow.choose_context(description, validation_before, depth)
+
+    workflow.set_step(f"Planning change for depth {depth}")
+    plan = workflow.plan(description, validation_before, context_items, depth)
+    if depth == 0:
+        workflow.set_step("Assessing implementation risk")
+        assessment = workflow.assess_strategy_risk(description, validation_before, context_items, plan, depth)
+        if assessment["risk_score"] > DEFAULT_STRATEGY_RISK_THRESHOLD and not workflow.request.get("allow_high_risk_strategy"):
+            workflow.result["pending_risk_review"] = {
+                "description": description,
+                "depth": depth,
+                "validation_before": validation_before.to_dict(),
+                "context_items": context_items,
+                "plan": plan,
+            }
+            workflow.state["status"] = "awaiting_risk_review"
+            workflow.state["current_step"] = "Awaiting risk review"
+            workflow.state["error"] = ""
+            workflow.persist()
+            workflow.log(
+                f"Paused before implementation because strategy risk {assessment['risk_score']:.2f} exceeded the default threshold "
+                f"of {DEFAULT_STRATEGY_RISK_THRESHOLD:.2f}.",
+                level="error",
+            )
+            raise RiskReviewRequired("Awaiting user review for elevated strategy risk.")
+        if assessment["risk_score"] > DEFAULT_STRATEGY_RISK_THRESHOLD:
+            assessment["status"] = "accepted_by_override"
+            assessment["decision_summary"] = "The user chose to continue despite the elevated strategy risk."
+        else:
+            assessment["status"] = "accepted"
+            assessment["decision_summary"] = "The strategy stayed within the default risk threshold."
+        workflow.result.pop("pending_risk_review", None)
+        workflow.persist()
+
+    return execute_planned_scope(workflow, description, validation_before, depth, applied_changes, context_items, plan)
+
+
+def resume_after_risk_override(workflow: Workflow) -> None:
+    pending = workflow.result.get("pending_risk_review", {})
+    if not isinstance(pending, dict) or not pending:
+        raise AppError("No paused risk-reviewed plan is available to resume.")
+    before_payload = pending.get("validation_before", {})
+    if not isinstance(before_payload, dict) or not before_payload.get("command"):
+        raise AppError("The paused risk-reviewed plan is missing its validation context.")
+    plan = pending.get("plan", {})
+    if not isinstance(plan, dict) or not plan:
+        raise AppError("The paused risk-reviewed plan is missing its execution plan.")
+    context_items = pending.get("context_items", [])
+    if not isinstance(context_items, list) or not context_items:
+        raise AppError("The paused risk-reviewed plan is missing its selected context.")
+
+    latest = latest_risk_assessment(workflow.result)
+    if latest:
+        latest["status"] = "accepted_by_override"
+        latest["decision_summary"] = "The user chose to continue despite the elevated strategy risk."
+    workflow.result.pop("pending_risk_review", None)
+    workflow.persist()
+    workflow.log("Resuming the paused plan after user override of the strategy risk warning.")
+
+    before = command_result_from_dict(before_payload)
+    applied_changes: list[dict] = []
+    try:
+        execute_planned_scope(
+            workflow,
+            str(pending.get("description", workflow.request["description"])),
+            before,
+            int(pending.get("depth", 0)),
+            applied_changes,
+            context_items,
+            plan,
+        )
+    except Exception:
+        if applied_changes:
+            rollback_prepared_changes(applied_changes)
+            workflow.log("An error occurred after resuming the paused plan; rolled the filesystem back.", level="error")
+            workflow.result["attempted_changes"] = [prepared_change_for_result(item) for item in applied_changes]
+            workflow.result["rolled_back_after_error"] = True
+            workflow.persist()
+        raise
+
+    workflow.result["attempted_changes"] = [prepared_change_for_result(item) for item in applied_changes]
+    workflow.persist()
+
+    workflow.set_step("Running validation after changes")
+    after = run_check_command(workflow.request["validation_command"])
+    workflow.result["validation_after"] = after.to_dict()
+    if after.exit_code != 0:
+        rollback_prepared_changes(applied_changes)
+        workflow.log("Validation failed after applying changes; rolled the filesystem back.", level="error")
+        workflow.set_status("rolled_back", error="Validation failed after applying the AI-generated changes.")
+        workflow.persist()
+        return
+
+    workflow.result["applied_changes"] = [prepared_change_for_result(item) for item in applied_changes]
+    workflow.result["attempted_changes"] = []
+    workflow.persist()
+    if workflow.remaining_budget() > 0:
+        try:
+            workflow.set_step("Suggesting next steps")
+            workflow.suggest_next_steps(after)
+        except Exception as err:
+            workflow.log(f"Skipping next-step suggestions: {err}", level="error")
+    workflow.set_status("completed")
+
+
 def run_workflow(change_id: str) -> None:
     ensure_runtime_dirs()
     workflow = Workflow(change_id)
+    if workflow.request.get("allow_high_risk_strategy") and workflow.result.get("pending_risk_review"):
+        workflow.set_status("running")
+        resume_after_risk_override(workflow)
+        return
     workflow.set_status("running")
     workflow.set_step("Generating a validation command")
     try:
@@ -1256,11 +1741,17 @@ def run_workflow(change_id: str) -> None:
     applied_changes: list[dict] = []
     try:
         execute_change_scope(workflow, workflow.request["description"], before, 0, applied_changes)
-    except Exception:
+    except RiskReviewRequired:
+        return
+    except Exception as err:
         if applied_changes:
             rollback_prepared_changes(applied_changes)
-            workflow.log("An error occurred after applying intermediate changes; rolled the filesystem back.", level="error")
+            if isinstance(err, AppError) and workflow.result.get("review", {}).get("approved") is False:
+                workflow.log("A later subchange was rejected during review; rolled back intermediate approved changes.", level="error")
+            else:
+                workflow.log("An error occurred after applying intermediate changes; rolled the filesystem back.", level="error")
             workflow.result["attempted_changes"] = [prepared_change_for_result(item) for item in applied_changes]
+            workflow.result["rolled_back_after_error"] = True
             workflow.persist()
         raise
 
@@ -1416,7 +1907,7 @@ def load_starter_prompts() -> list[dict]:
         prompt_text_value = read_text(prompt_path).strip()
         item = dict(spec)
         item["prompt"] = prompt_text_value
-        item["file_url"] = route_url("/file", path=f"examples/ai/starter-prompts/{spec['file']}")
+        item["file_url"] = served_app_url_for_path(prompt_path)
         prompts.append(item)
     return prompts
 
@@ -1441,6 +1932,55 @@ def render_command_result(result: dict, heading: str) -> str:
 """
 
 
+def render_ai_call_link(change_id: str, call_id: str, label: str = "View AI request and response") -> str:
+    call_id = str(call_id).strip()
+    if not call_id:
+        return ""
+    return f'<a href="{e(ai_call_url(change_id, call_id))}">{e(label)}</a>'
+
+
+def render_ai_call_links(change_id: str, pairs: list[tuple[str, str]]) -> str:
+    links = [render_ai_call_link(change_id, call_id, label) for label, call_id in pairs if str(call_id).strip()]
+    links = [item for item in links if item]
+    if not links:
+        return ""
+    return "<p>" + " | ".join(links) + "</p>"
+
+
+def render_ai_activity(change_id: str, calls: list[dict]) -> str:
+    if not calls:
+        return ""
+    rows = []
+    for item in calls:
+        label = f"Call {item.get('call_number', '?')}: {item.get('prompt', '')}"
+        summary = str(item.get("assistant_message", "")).strip() or "(no assistant message)"
+        row = f"<li><a href=\"{e(ai_call_url(change_id, str(item.get('call_id', ''))))}\">{e(label)}</a>"
+        row += f" <span class=\"meta\">{e(item.get('timestamp', ''))}</span>"
+        if item.get("error"):
+            row += f"<p>{e(item['error'])}</p>"
+        else:
+            row += f"<p>{e(shorten(summary, 220))}</p>"
+        row += "</li>"
+        rows.append(row)
+    return f"<section class=\"card\"><h2>AI call logs</h2><ul class=\"stack-list\">{''.join(rows)}</ul></section>"
+
+
+def render_decomposition(change_id: str, items: list[dict]) -> str:
+    if not items:
+        return ""
+    rows = []
+    for item in items:
+        subchanges = item.get("subchanges", [])
+        lines = "".join(f"<li>{e(str(sub.get('description', '')).strip())}</li>" for sub in subchanges if str(sub.get("description", "")).strip())
+        row = f"<li><p><strong>Depth {e(item.get('depth', ''))}:</strong> {e(item.get('description', ''))}</p>"
+        row += render_ai_call_links(change_id, [("View planning request and response", item.get("ai_call_id", ""))])
+        if lines:
+            row += f"<ul class=\"stack-list\">{lines}</ul>"
+        row += "</li>"
+        rows.append(row)
+    return f"<section class=\"card\"><h2>Decomposition</h2><ul class=\"stack-list\">{''.join(rows)}</ul></section>"
+
+
 def key_instructions_card(message: str) -> str:
     return f"""
 <section class="card">
@@ -1462,7 +2002,7 @@ def key_instructions_page(message: str) -> str:
     return html_page(
         "Configure OpenRouter",
         body,
-        subtitle="A valid OpenRouter API key is required for validation-command generation, risk scoring, context gathering, planning, implementation, review, and follow-up suggestions.",
+        subtitle="A valid OpenRouter API key is required for validation-command generation, strategy risk assessment, context gathering, planning, implementation, review, and follow-up suggestions.",
     )
 
 
@@ -1640,7 +2180,9 @@ def handle_home() -> None:
     primary_model_picker, primary_model_notice = render_primary_model_picker(models, prefs.get("favorite_models", []), selected_model)
     primary_notice_html = f"<p class=\"banner\">{e(primary_model_notice)}</p>" if primary_model_notice else ""
     validation_summary = (
+        "<p class=\"banner\"><strong>Filesystem mapping:</strong> this example serves <code>examples/ai</code> directly, so ordinary files under that tree keep matching URL paths whenever possible.</p>"
         "<p class=\"banner\"><strong>Validation command:</strong> generated automatically from your change description, then checked by an allowlist, risk scoring, and a failing preflight requirement.</p>"
+        "<p class=\"banner\"><strong>Strategy risk review:</strong> after planning, the app performs a separate risk assessment. If that score exceeds the default threshold, the workflow pauses so you can continue anyway or provide a safer strategy.</p>"
     )
     change_checked = " checked" if active_tab == "change" else ""
     gallery_checked = " checked" if active_tab == "gallery" else ""
@@ -1695,7 +2237,7 @@ def handle_home() -> None:
         <p>Validation commands are auto-generated per request and cannot be prefilled in Settings.</p>
         {model_warning}
         {model_source_note}
-        <p class="banner">The worker will synthesize a repo-specific validation command, reject unsafe commands, and require the preflight check to fail before edits begin.</p>
+        <p class="banner">The worker will synthesize a repo-specific validation command, reject unsafe commands, require the preflight check to fail before edits begin, and pause for user review if the planned execution strategy looks too risky.</p>
         <p><strong>Server root:</strong> <code>{e(target_root())}</code></p>
         <p><strong>Last model:</strong> <code>{e(prefs.get('last_model') or '(none yet)')}</code></p>
         <p><strong>Last budget:</strong> {e(prefs.get('last_budget'))}</p>
@@ -1752,6 +2294,80 @@ def handle_change_post() -> None:
     redirect(f"/changes/{change_id}")
 
 
+def handle_change_action_post() -> None:
+    change_id = os.environ.get("PARAM_ID", "")
+    params = form_params()
+    action = params.get("action", "").strip()
+    request = load_request(change_id)
+    state = load_state(change_id)
+    result = load_result(change_id)
+
+    if state.get("status") != "awaiting_risk_review":
+        redirect(f"/changes/{change_id}")
+        return
+
+    if action == "ignore_risk":
+        request["allow_high_risk_strategy"] = True
+        request["risk_override_at"] = utc_timestamp()
+        latest = latest_risk_assessment(result)
+        if latest:
+            latest["user_decision"] = "continue_anyway"
+            latest["decision_at"] = utc_timestamp()
+            latest["decision_summary"] = "The user chose to continue despite the elevated strategy risk."
+        save_request(change_id, request)
+        save_result(change_id, result)
+        state["status"] = "queued"
+        state["current_step"] = "Queued"
+        state["error"] = ""
+        state["updated_at"] = utc_timestamp()
+        state.pop("completed_at", None)
+        save_state(change_id, state)
+        append_event(change_id, "User chose to continue despite the elevated strategy risk warning.")
+        spawn_worker(change_id)
+        redirect(f"/changes/{change_id}")
+        return
+
+    if action == "revise_strategy":
+        strategy_notes = params.get("strategy_notes", "").strip()
+        if not strategy_notes:
+            response_headers(status=400)
+            print(
+                html_page(
+                    "Strategy Required",
+                    f"<section class=\"card\"><p>Provide a safer strategy before retrying.</p><p><a href=\"/changes/{e(change_id)}\">Back to change</a></p></section>",
+                    subtitle="The workflow is waiting for a strategy that addresses the elevated risk.",
+                )
+            )
+            return
+        request["strategy_notes"] = strategy_notes
+        request["allow_high_risk_strategy"] = False
+        request["risk_override_at"] = ""
+        latest = latest_risk_assessment(result)
+        if latest:
+            latest["user_decision"] = "revise_strategy"
+            latest["decision_at"] = utc_timestamp()
+            latest["decision_summary"] = "The user requested a different strategy to lower the risk."
+        queue_change_retry(
+            change_id,
+            request,
+            state,
+            result,
+            message="User proposed a different strategy after reviewing the elevated risk.",
+        )
+        spawn_worker(change_id)
+        redirect(f"/changes/{change_id}")
+        return
+
+    response_headers(status=400)
+    print(
+        html_page(
+            "Unknown Action",
+            f"<section class=\"card\"><p>Unsupported change action: {e(action or '(empty)')}</p><p><a href=\"/changes/{e(change_id)}\">Back to change</a></p></section>",
+            subtitle="The change page received an action it does not understand.",
+        )
+    )
+
+
 def render_context_items(change_id: str, items: list[dict]) -> str:
     if not items:
         return "<p class=\"empty\">No context was captured.</p>"
@@ -1763,6 +2379,8 @@ def render_context_items(change_id: str, items: list[dict]) -> str:
   <a href="{e(route_url('/context', change=change_id, index=index))}">{e(item['path'])}:{e(item['start_line'])}-{e(item['end_line'])}</a>
   <span class="meta">{e(item.get('scope', ''))}</span>
   <p>{e(item.get('reason', ''))}</p>
+  <p><a href="{e(item['file_url'])}">Open current file directly</a></p>
+  {render_ai_call_links(change_id, [("View selector request and response", item.get("ai_call_id", ""))])}
 </li>
 """
         )
@@ -1780,7 +2398,8 @@ def render_change_items(change_id: str, items: list[dict], heading: str) -> str:
   <a href="{e(route_url('/diff', change=change_id, index=index))}">{e(item['path'])}</a>
   <span class="status-chip">{e(item['action'])}</span>
   <p>{e(item['description'])}</p>
-  <p><a href="{e(item['file_url'])}">Open current file view</a></p>
+  <p><a href="{e(item['file_url'])}">Open current file directly</a></p>
+  {render_ai_call_links(change_id, [("View implementation request and response", item.get("ai_call_id", ""))])}
 </li>
 """
         )
@@ -1796,7 +2415,7 @@ def render_events(events: list[dict]) -> str:
     return "<ul class=\"stack-list\">" + "".join(rows) + "</ul>"
 
 
-def render_next_steps(steps: list[dict], request: dict) -> str:
+def render_next_steps(change_id: str, steps: list[dict], request: dict) -> str:
     if not steps:
         return ""
     rows = []
@@ -1812,13 +2431,93 @@ def render_next_steps(steps: list[dict], request: dict) -> str:
 <li>
   <a href="{e(url)}">{e(item.get('description', ''))}</a>
   <p>{e(item.get('why', ''))}</p>
+  {render_ai_call_links(change_id, [("View next-step request and response", item.get("ai_call_id", ""))])}
 </li>
 """
         )
     return f"<section class=\"card\"><h2>Likely next steps</h2><ul class=\"stack-list\">{''.join(rows)}</ul></section>"
 
 
-def render_validation_generation(info: dict) -> str:
+def render_risk_assessments(change_id: str, assessments: list[dict], state: dict, request: dict) -> str:
+    if not assessments:
+        return ""
+    latest = assessments[-1]
+    awaiting_review = state.get("status") == "awaiting_risk_review"
+    rows = []
+    for item in reversed(assessments[-5:]):
+        concerns = item.get("concerns", [])
+        concerns_html = "".join(f"<li>{e(concern)}</li>" for concern in concerns) or "<li>No specific risks were listed.</li>"
+        bypass = item.get("bypass_strategies", [])
+        bypass_html = "".join(f"<li>{e(strategy)}</li>" for strategy in bypass) or "<li>No bypass strategy was suggested.</li>"
+        plan_subchanges = item.get("plan_subchanges", [])
+        subchange_html = ""
+        if isinstance(plan_subchanges, list) and plan_subchanges:
+            details = []
+            for subchange in plan_subchanges:
+                description = str(subchange.get("description", "")).strip()
+                title = str(subchange.get("title", "")).strip()
+                if title and description:
+                    details.append(f"<li>{e(title)}: {e(description)}</li>")
+                elif description:
+                    details.append(f"<li>{e(description)}</li>")
+            if details:
+                subchange_html = f"<p><strong>Planned subchanges:</strong></p><ul class=\"stack-list\">{''.join(details)}</ul>"
+        decision_summary = str(item.get("decision_summary", "")).strip()
+        row = (
+            f"<li><p><strong>{e(item.get('created_at', ''))}</strong> "
+            f"<span class=\"status-chip\">{e(item.get('status', ''))}</span></p>"
+            f"<p><strong>Risk score:</strong> {e(item.get('risk_score', ''))} "
+            f"(default threshold {e(item.get('threshold', DEFAULT_STRATEGY_RISK_THRESHOLD))})</p>"
+            f"<p><strong>Plan:</strong> {e(item.get('plan_action', 'implement'))}</p>"
+        )
+        if item.get("plan_reason"):
+            row += f"<p>{e(item.get('plan_reason', ''))}</p>"
+        if item.get("summary"):
+            row += f"<p><strong>Assessment:</strong> {e(item.get('summary', ''))}</p>"
+        if item.get("strategy_notes"):
+            row += f"<p><strong>User strategy notes:</strong> {e(item.get('strategy_notes', ''))}</p>"
+        row += render_ai_call_links(change_id, [("View strategy-risk request and response", item.get("ai_call_id", ""))])
+        row += f"<p><strong>Risks to consider:</strong></p><ul class=\"stack-list\">{concerns_html}</ul>"
+        row += f"<p><strong>Lower-risk strategies:</strong></p><ul class=\"stack-list\">{bypass_html}</ul>"
+        row += subchange_html
+        if decision_summary:
+            row += f"<p><strong>Decision:</strong> {e(decision_summary)}</p>"
+        row += "</li>"
+        rows.append(row)
+
+    action_block = ""
+    if awaiting_review:
+        suggestions = latest.get("bypass_strategies", [])
+        suggestions_html = ""
+        if suggestions:
+            suggestions_html = "<ul class=\"stack-list\">" + "".join(f"<li>{e(item)}</li>" for item in suggestions) + "</ul>"
+        action_block = f"""
+<section class="card warning-card">
+  <h3>Risk review required</h3>
+  <p>The workflow paused because the strategy risk score <strong>{e(latest.get('risk_score', ''))}</strong> is above the default threshold <strong>{e(latest.get('threshold', DEFAULT_STRATEGY_RISK_THRESHOLD))}</strong>.</p>
+  <p>{e(latest.get('summary', 'Review the listed risks before continuing.'))}</p>
+  {suggestions_html}
+  <form method="post" action="/changes/{e(change_id)}" class="stack-form">
+    <input type="hidden" name="action" value="ignore_risk">
+    <button type="submit">Ignore risks and continue</button>
+  </form>
+  <form method="post" action="/changes/{e(change_id)}" class="stack-form">
+    <input type="hidden" name="action" value="revise_strategy">
+    <label>
+      <span>Different strategy</span>
+      <textarea name="strategy_notes" rows="6" required>{e(request.get('strategy_notes', ''))}</textarea>
+    </label>
+    <button type="submit" class="ghost-button">Retry with a different strategy</button>
+  </form>
+</section>
+"""
+    return (
+        f"<section class=\"card\"><h2>Strategy risk assessment</h2>{action_block}"
+        f"<ul class=\"stack-list\">{''.join(rows)}</ul></section>"
+    )
+
+
+def render_validation_generation(change_id: str, info: dict) -> str:
     attempts = info.get("attempts", [])
     if not attempts:
         return ""
@@ -1839,6 +2538,13 @@ def render_validation_generation(info: dict) -> str:
             f"<code>{e(command or '(empty)')}</code> "
             f"<span class=\"status-chip\">{e(outcome)}</span></p>"
         )
+        row += render_ai_call_links(
+            change_id,
+            [
+                ("View command-generation request and response", item.get("generator_ai_call_id", "")),
+                ("View risk-check request and response", item.get("risk_ai_call_id", "")),
+            ],
+        )
         if risk_score != "":
             row += f"<p><strong>Risk score:</strong> {e(risk_score)}"
             if risk_summary:
@@ -1855,6 +2561,13 @@ def render_validation_generation(info: dict) -> str:
     extras = ""
     if accepted:
         extras += f"<p><strong>Accepted command:</strong> <code>{e(accepted)}</code></p>"
+        extras += render_ai_call_links(
+            change_id,
+            [
+                ("Accepted command request/response", info.get("accepted_ai_call_id", "")),
+                ("Accepted risk-check request/response", info.get("accepted_risk_ai_call_id", "")),
+            ],
+        )
     if info.get("accepted_risk_score", "") != "":
         extras += (
             f"<p><strong>Accepted risk score:</strong> {e(info.get('accepted_risk_score'))} "
@@ -1874,15 +2587,19 @@ def handle_change_detail() -> None:
     state = load_state(change_id)
     result = load_result(change_id)
     events = load_events(change_id)
+    ai_calls = load_ai_calls(change_id)
 
     running = state.get("status") in {"queued", "running"}
     refresh = REFRESH_SECONDS if running else None
     summary = f"Model {request.get('model')} with an AI budget of {request.get('ai_budget')} calls."
     validation_command = request.get("validation_command", "") or "(pending generation)"
+    strategy_notes = str(request.get("strategy_notes", "")).strip()
+    strategy_html = f"<p><strong>Strategy notes:</strong> {e(strategy_notes)}</p>" if strategy_notes else ""
     status_card = f"""
 <section class="card">
   <h2>Request</h2>
   <p>{e(request.get('description', ''))}</p>
+  {strategy_html}
   <p><strong>Status:</strong> <span class="status-chip">{e(state.get('status', 'unknown'))}</span></p>
   <p><strong>Current step:</strong> {e(state.get('current_step', ''))}</p>
   <p><strong>Server root:</strong> <code>{e(request.get('server_root', ''))}</code></p>
@@ -1891,8 +2608,19 @@ def handle_change_detail() -> None:
 </section>
 """
     pieces = [status_card]
+    if result.get("rolled_back_after_error"):
+        pieces.append(
+            """
+<section class="card">
+  <h2>Rollback</h2>
+  <p>Earlier approved edits were rolled back because a later subchange was rejected during review.</p>
+</section>
+"""
+        )
     if result.get("validation_command_generation"):
-        pieces.append(render_validation_generation(result["validation_command_generation"]))
+        pieces.append(render_validation_generation(change_id, result["validation_command_generation"]))
+    if result.get("risk_assessments"):
+        pieces.append(render_risk_assessments(change_id, result["risk_assessments"], state, request))
     if "existing_evidence" in result:
         evidence = result["existing_evidence"]
         pieces.append(
@@ -1909,16 +2637,20 @@ def handle_change_detail() -> None:
         pieces.append(
             f"<section class=\"card\"><h2>Context used for the change</h2>{render_context_items(change_id, result['context_items'])}</section>"
         )
+    if result.get("decomposition"):
+        pieces.append(render_decomposition(change_id, result["decomposition"]))
     if result.get("review"):
         review = result["review"]
         issues = review.get("issues", [])
         issues_html = "".join(f"<li>{e(issue)}</li>" for issue in issues) or "<li>No review issues were reported.</li>"
+        review_links = render_ai_call_links(change_id, [("View review request and response", review.get("ai_call_id", ""))])
         pieces.append(
             f"""
 <section class="card">
   <h2>Review</h2>
   <p>{e(review.get('summary', ''))}</p>
   <p><strong>Approved:</strong> {e(review.get('approved', False))}</p>
+  {review_links}
   <ul class="stack-list">{issues_html}</ul>
 </section>
 """
@@ -1929,7 +2661,8 @@ def handle_change_detail() -> None:
         pieces.append(render_change_items(change_id, result["applied_changes"], "Applied changes"))
     if result.get("attempted_changes"):
         pieces.append(render_change_items(change_id, result["attempted_changes"], "Attempted changes"))
-    pieces.append(render_next_steps(result.get("next_steps", []), request))
+    pieces.append(render_next_steps(change_id, result.get("next_steps", []), request))
+    pieces.append(render_ai_activity(change_id, ai_calls))
     pieces.append(f"<section class=\"card\"><h2>Workflow events</h2>{render_events(events)}</section>")
     if state.get("error"):
         pieces.append(f"<section class=\"card\"><h2>Error</h2><pre>{e(state['error'])}</pre></section>")
@@ -1980,7 +2713,7 @@ def handle_context_view() -> None:
   <h2>{e(item['path'])}:{e(item['start_line'])}-{e(item['end_line'])}</h2>
   <p><strong>Scope:</strong> {e(item.get('scope', ''))}</p>
   <p><strong>Reason:</strong> {e(item.get('reason', ''))}</p>
-  <p><a href="{e(item['file_url'])}">Open current file slice</a></p>
+  <p><a href="{e(item['file_url'])}">Open current file directly</a></p>
   <pre>{e(item.get('content', ''))}</pre>
   <p><a href="/changes/{e(change_id)}">Back to change</a></p>
 </section>
@@ -2006,13 +2739,64 @@ def handle_diff_view() -> None:
   <h2>{e(item['path'])}</h2>
   <p><strong>Action:</strong> {e(item['action'])}</p>
   <p>{e(item['description'])}</p>
-  <p><a href="{e(item['file_url'])}">Open current file</a></p>
+  <p><a href="{e(item['file_url'])}">Open current file directly</a></p>
   <pre>{e(item.get('diff', '(no diff available)'))}</pre>
   <p><a href="/changes/{e(change_id)}">Back to change</a></p>
 </section>
 """
     response_headers()
     print(html_page("Change diff", body, subtitle="Stored diff for this requested change"))
+
+
+def handle_ai_call_view() -> None:
+    params = query_params()
+    change_id = params.get("change", "")
+    call_id = params.get("call", "")
+    payload = load_ai_call_log(change_id, call_id)
+    relative_log_path = str(payload.get("log_path", "")).strip()
+    raw_log_link = ""
+    direct_log_path = served_app_path(relative_log_path)
+    if direct_log_path:
+        raw_log_link = f"<p><a href=\"{e(direct_log_path)}\">Open stored log file directly</a></p>"
+    elif relative_log_path and not relative_log_path.startswith("/"):
+        raw_log_link = f"<p><a href=\"{e(route_url('/file', path=relative_log_path))}\">Open stored log file</a></p>"
+    error_block = ""
+    if payload.get("error"):
+        error_block = f"<p><strong>Error:</strong> {e(payload.get('error', ''))}</p>"
+    body = f"""
+<section class="card">
+  <h2>AI call {e(call_id)}</h2>
+  <p><strong>Prompt:</strong> {e(payload.get('prompt', ''))}</p>
+  <p><strong>Model:</strong> <code>{e(payload.get('model', ''))}</code></p>
+  <p><strong>Timestamp:</strong> {e(payload.get('timestamp', ''))}</p>
+  <p><strong>Log path:</strong> <code>{e(relative_log_path or '(unknown)')}</code></p>
+  {error_block}
+  {raw_log_link}
+  <details open>
+    <summary>System prompt</summary>
+    <pre>{e(payload.get('system_prompt', ''))}</pre>
+  </details>
+  <details open>
+    <summary>User prompt</summary>
+    <pre>{e(payload.get('user_prompt', ''))}</pre>
+  </details>
+  <details open>
+    <summary>Request</summary>
+    <pre>{e(json_pretty(payload.get('request', {})))}</pre>
+  </details>
+  <details open>
+    <summary>Response</summary>
+    <pre>{e(json_pretty(payload.get('response', {})))}</pre>
+  </details>
+  <details open>
+    <summary>Assistant message</summary>
+    <pre>{e(payload.get('assistant_message', ''))}</pre>
+  </details>
+  <p><a href="/changes/{e(change_id)}">Back to change</a></p>
+</section>
+"""
+    response_headers()
+    print(html_page("AI call log", body, subtitle="Exact saved request and response for this OpenRouter call"))
 
 
 def render_error_page(err: Exception) -> None:

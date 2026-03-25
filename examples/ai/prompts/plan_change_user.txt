@@ -1,6 +1,9 @@
 Requested change:
 {{CHANGE_DESCRIPTION}}
 
+User strategy notes:
+{{STRATEGY_NOTES}}
+
 Validation command:
 {{VALIDATION_COMMAND}}
 

@@ -135,6 +135,11 @@ h1 {
   backdrop-filter: blur(8px);
 }
 
+.warning-card {
+  border-color: rgba(209, 93, 55, 0.42);
+  background: rgba(255, 246, 239, 0.96);
+}
+
 .notice {
   margin-bottom: 1rem;
 }
@@ -255,6 +260,10 @@ button {
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+.warning-card button {
+  width: fit-content;
 }
 
 .ghost-button,

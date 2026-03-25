@@ -200,13 +200,20 @@ cd python && python3 fsrouter.py
 Located in `examples/ai/`.
 
 The app now auto-generates a validation command per request, risk-scores it,
-and requires the preflight check to fail before any filesystem edits begin.
+requires the preflight check to fail before any filesystem edits begin, and
+adds a separate planning-stage risk review that pauses for user input when the
+strategy looks too risky.
+
+This example is intended to keep URL-to-filesystem mapping direct: serve
+`examples/ai` itself as the route root, let ordinary files under that tree be
+reachable at matching URL paths, and reserve custom handlers for derived views
+such as workflow state, stored snapshots, and diffs.
 
 - Run:
 
 ```bash
 export OPENROUTER_API_KEY=your_key_here
-ROUTE_DIR=examples/ai/routes python3 python/fsrouter.py
+ROUTE_DIR=examples/ai python3 python/fsrouter.py
 ```
 
 - Docs:
