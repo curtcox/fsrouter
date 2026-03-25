@@ -15,5 +15,5 @@ from ai_change_app import handle_context_view, render_error_page
 if __name__ == "__main__":
     try:
         handle_context_view()
-    except Exception as err:  # pragma: no cover - CGI surface
+    except Exception as err:  # pragma: no cover - handler surface
         render_error_page(err)

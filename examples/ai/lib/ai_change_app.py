@@ -176,8 +176,25 @@ def query_params() -> dict[str, str]:
 
 def form_params() -> dict[str, str]:
     body = sys.stdin.buffer.read()
+    content_type = os.environ.get("CONTENT_TYPE", "").lower()
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError as err:
+            raise AppError(f"Invalid JSON body: {err}") from err
+        if not isinstance(payload, dict):
+            raise AppError("JSON request body must be an object.")
+        return {str(key): "" if value is None else str(value) for key, value in payload.items()}
     parsed = urllib.parse.parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
     return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def emit_json(payload: dict | list, *, status: int = 200) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if status >= 500:
+        raise SystemExit(2)
+    if status >= 400:
+        raise SystemExit(1)
 
 
 def response_headers(status: int = 200, content_type: str = "text/html; charset=utf-8", extra: dict[str, str] | None = None) -> None:
@@ -2152,124 +2169,77 @@ def render_starter_gallery(starter_prompts: list[dict], selected_model: str) -> 
 def handle_home() -> None:
     ensure_runtime_dirs()
     prefs = load_preferences()
-    setup_notice = ""
+    setup = {}
     try:
         models, model_notice = list_available_models()
     except InvalidAPIKeyError as err:
         models, model_notice = [], str(err)
-        setup_notice = key_instructions_card(str(err))
+        setup = {
+            "required": True,
+            "message": str(err),
+            "steps": [
+                "Create or copy an API key from https://openrouter.ai/keys.",
+                "Export OPENROUTER_API_KEY before starting fsrouter.",
+                "Optionally set AI_CHANGE_ROOT to point at another workspace.",
+            ],
+        }
     except AppError as err:
         models, model_notice = [], str(err)
+        setup = {"required": False, "message": str(err)}
 
     params = query_params()
-    requested_tab = params.get("tab", "").strip()
-    active_tab = requested_tab if requested_tab in {"gallery", "settings"} else "change"
     selected_model = selected_model_value(params, prefs, models)
-    budget = params.get("budget", str(prefs["last_budget"]))
-    description = params.get("description", "")
-    recent_changes_html = render_recent_changes(list_recent_changes())
-    favorites_html = render_favorites(prefs)
-    starter_prompts = load_starter_prompts()
-    model_warning = f"<p class=\"banner\">{e(model_notice)}</p>" if model_notice else ""
-    model_source_note = ""
-    if models:
-        model_source_note = (
-            f"<p class=\"banner\">Loaded {len(models)} current models from "
-            "<code>https://openrouter.ai/api/v1/models</code>.</p>"
-        )
-    primary_model_picker, primary_model_notice = render_primary_model_picker(models, prefs.get("favorite_models", []), selected_model)
-    primary_notice_html = f"<p class=\"banner\">{e(primary_model_notice)}</p>" if primary_model_notice else ""
-    validation_summary = (
-        "<p class=\"banner\"><strong>Filesystem mapping:</strong> this example serves <code>examples/ai</code> directly, so ordinary files under that tree keep matching URL paths whenever possible.</p>"
-        "<p class=\"banner\"><strong>Validation command:</strong> generated automatically from your change description, then checked by an allowlist, risk scoring, and a failing preflight requirement.</p>"
-        "<p class=\"banner\"><strong>Strategy risk review:</strong> after planning, the app performs a separate risk assessment. If that score exceeds the default threshold, the workflow pauses so you can continue anyway or provide a safer strategy.</p>"
+    emit_json(
+        {
+            "app": "fsrouter-ai-change-assistant",
+            "message": "Use POST /changes to queue a request, then poll GET /changes/:id for status.",
+            "model_notice": model_notice,
+            "models": models,
+            "selected_model": selected_model,
+            "preferences": prefs,
+            "recent_changes": list_recent_changes(),
+            "starter_prompts": load_starter_prompts(),
+            "server_root": str(target_root()),
+            "data_root": str(DATA_ROOT),
+            "setup": setup,
+            "endpoints": {
+                "create_change": "/changes (POST)",
+                "change_detail": "/changes/:id (GET)",
+                "change_action": "/changes/:id (POST)",
+                "favorites": "/preferences (POST)",
+                "file_slice": "/file?path=...&start=...&end=... (GET)",
+                "context_item": "/context?change=...&index=... (GET)",
+                "diff_item": "/diff?change=...&index=... (GET)",
+                "ai_call_log": "/ai-call?change=...&call=... (GET)",
+            },
+        }
     )
-    change_checked = " checked" if active_tab == "change" else ""
-    gallery_checked = " checked" if active_tab == "gallery" else ""
-    settings_checked = " checked" if active_tab == "settings" else ""
-    body = f"""
-{setup_notice}
-<section class="tabs">
-  <input type="radio" name="home-tab" id="tab-change" class="tab-toggle"{change_checked}>
-  <input type="radio" name="home-tab" id="tab-gallery" class="tab-toggle"{gallery_checked}>
-  <input type="radio" name="home-tab" id="tab-settings" class="tab-toggle"{settings_checked}>
-  <div class="tab-strip">
-    <label for="tab-change" class="tab-label">Change</label>
-    <label for="tab-gallery" class="tab-label">Gallery</label>
-    <label for="tab-settings" class="tab-label">Settings</label>
-  </div>
-  <section class="tab-panel tab-panel-change">
-    <section class="card">
-      <h2>Request a change</h2>
-      <p>Pick a favorite model, describe the change, optionally start from a gallery example, set the AI budget, and submit.</p>
-      {model_warning}
-      {primary_notice_html}
-      {validation_summary}
-      <form method="post" action="/changes" class="stack-form">
-        {primary_model_picker}
-        <label>
-          <span>Change description</span>
-          <textarea name="description" rows="8" required>{e(description)}</textarea>
-        </label>
-        <label>
-          <span>Total AI call budget</span>
-          <input type="number" min="1" max="40" name="ai_budget" value="{e(budget)}" required>
-        </label>
-        <label class="checkbox-row">
-          <input type="checkbox" name="favorite_model" value="1">
-          <span>Keep the chosen model in favorites</span>
-        </label>
-        <button type="submit">Queue change request</button>
-      </form>
-    </section>
-  </section>
-  <section class="tab-panel tab-panel-gallery">
-    <section class="card">
-      <h2>Starter gallery</h2>
-      <p>These are example change requests meant to teach what the app can do. Pick one, customize it on the Change tab, then submit when it matches what you want.</p>
-      {render_starter_gallery(starter_prompts, selected_model)}
-    </section>
-  </section>
-  <section class="tab-panel tab-panel-settings">
-    <section class="grid">
-      <section class="card">
-        <h2>Settings</h2>
-        <p>Validation commands are auto-generated per request and cannot be prefilled in Settings.</p>
-        {model_warning}
-        {model_source_note}
-        <p class="banner">The worker will synthesize a repo-specific validation command, reject unsafe commands, require the preflight check to fail before edits begin, and pause for user review if the planned execution strategy looks too risky.</p>
-        <p><strong>Server root:</strong> <code>{e(target_root())}</code></p>
-        <p><strong>Last model:</strong> <code>{e(prefs.get('last_model') or '(none yet)')}</code></p>
-        <p><strong>Last budget:</strong> {e(prefs.get('last_budget'))}</p>
-      </section>
-      <section class="card">
-        <h2>Favorite models</h2>
-        {favorites_html}
-        <form method="post" action="/preferences" class="inline-form">
-          <input type="hidden" name="action" value="add">
-          {render_model_picker(models, prefs.get("favorite_models", []), selected_model, "model", "Add a favorite model")}
-          <button type="submit" class="ghost-button">Add favorite</button>
-        </form>
-      </section>
-    </section>
-  </section>
-</section>
-<section class="card">
-  <h2>Recent change requests</h2>
-  {recent_changes_html}
-</section>
-"""
-    response_headers()
-    print(html_page("AI change assistant", body, subtitle="This fsrouter example uses OpenRouter to plan, review, apply, validate, and document requested filesystem changes."))
 
 
 def handle_preferences_post() -> None:
     params = form_params()
     action = params.get("action", "").strip()
     model = params.get("model", "").strip()
-    if action in {"add", "remove"} and model:
-        update_favorite_model(model, action)
-    redirect("/?tab=settings")
+    if action not in {"add", "remove"}:
+        emit_json(
+            {
+                "error": "invalid_action",
+                "message": f"Unsupported preferences action: {action or '(empty)'}",
+                "allowed_actions": ["add", "remove"],
+            },
+            status=400,
+        )
+    if not model:
+        emit_json({"error": "invalid_model", "message": "Model is required."}, status=400)
+    update_favorite_model(model, action)
+    emit_json(
+        {
+            "status": "ok",
+            "action": action,
+            "model": model,
+            "preferences": load_preferences(),
+        }
+    )
 
 
 def handle_change_post() -> None:
@@ -2282,16 +2252,39 @@ def handle_change_post() -> None:
     except ValueError:
         ai_budget = DEFAULT_AI_BUDGET
     if not description or not model:
-        response_headers(status=400)
-        print(html_page("Missing fields", "<section class=\"card\"><p>Description and model are required.</p><p><a href=\"/\">Back</a></p></section>"))
-        return
+        emit_json(
+            {
+                "error": "missing_fields",
+                "message": "Description and model are required.",
+            },
+            status=400,
+        )
     if not openrouter_api_key():
-        response_headers()
-        print(key_instructions_page("OPENROUTER_API_KEY is missing."))
-        return
+        emit_json(
+            {
+                "error": "missing_openrouter_api_key",
+                "message": "OPENROUTER_API_KEY is missing.",
+                "setup_steps": [
+                    "Create or copy an API key from https://openrouter.ai/keys.",
+                    "Export OPENROUTER_API_KEY before starting fsrouter.",
+                    "Restart fsrouter and retry the request.",
+                ],
+            },
+            status=400,
+        )
     change_id = create_change_request(description, model, ai_budget, favorite)
     spawn_worker(change_id)
-    redirect(f"/changes/{change_id}")
+    emit_json(
+        {
+            "status": "queued",
+            "change_id": change_id,
+            "change_path": f"/changes/{change_id}",
+            "poll_after_seconds": REFRESH_SECONDS,
+            "description": description,
+            "model": model,
+            "ai_budget": ai_budget,
+        }
+    )
 
 
 def handle_change_action_post() -> None:
@@ -2303,8 +2296,15 @@ def handle_change_action_post() -> None:
     result = load_result(change_id)
 
     if state.get("status") != "awaiting_risk_review":
-        redirect(f"/changes/{change_id}")
-        return
+        emit_json(
+            {
+                "error": "risk_review_not_active",
+                "message": "The change is not currently waiting for strategy risk review.",
+                "change_id": change_id,
+                "status": state.get("status", "unknown"),
+            },
+            status=400,
+        )
 
     if action == "ignore_risk":
         request["allow_high_risk_strategy"] = True
@@ -2324,21 +2324,27 @@ def handle_change_action_post() -> None:
         save_state(change_id, state)
         append_event(change_id, "User chose to continue despite the elevated strategy risk warning.")
         spawn_worker(change_id)
-        redirect(f"/changes/{change_id}")
+        emit_json(
+            {
+                "status": "queued",
+                "change_id": change_id,
+                "message": "Risk warning ignored; workflow resumed.",
+                "poll_after_seconds": REFRESH_SECONDS,
+            }
+        )
         return
 
     if action == "revise_strategy":
         strategy_notes = params.get("strategy_notes", "").strip()
         if not strategy_notes:
-            response_headers(status=400)
-            print(
-                html_page(
-                    "Strategy Required",
-                    f"<section class=\"card\"><p>Provide a safer strategy before retrying.</p><p><a href=\"/changes/{e(change_id)}\">Back to change</a></p></section>",
-                    subtitle="The workflow is waiting for a strategy that addresses the elevated risk.",
-                )
+            emit_json(
+                {
+                    "error": "missing_strategy_notes",
+                    "message": "Provide strategy_notes before retrying.",
+                    "change_id": change_id,
+                },
+                status=400,
             )
-            return
         request["strategy_notes"] = strategy_notes
         request["allow_high_risk_strategy"] = False
         request["risk_override_at"] = ""
@@ -2355,16 +2361,24 @@ def handle_change_action_post() -> None:
             message="User proposed a different strategy after reviewing the elevated risk.",
         )
         spawn_worker(change_id)
-        redirect(f"/changes/{change_id}")
+        emit_json(
+            {
+                "status": "queued",
+                "change_id": change_id,
+                "message": "Retry queued with revised strategy.",
+                "strategy_notes": strategy_notes,
+                "poll_after_seconds": REFRESH_SECONDS,
+            }
+        )
         return
 
-    response_headers(status=400)
-    print(
-        html_page(
-            "Unknown Action",
-            f"<section class=\"card\"><p>Unsupported change action: {e(action or '(empty)')}</p><p><a href=\"/changes/{e(change_id)}\">Back to change</a></p></section>",
-            subtitle="The change page received an action it does not understand.",
-        )
+    emit_json(
+        {
+            "error": "invalid_action",
+            "message": f"Unsupported change action: {action or '(empty)'}",
+            "allowed_actions": ["ignore_risk", "revise_strategy"],
+        },
+        status=400,
     )
 
 
@@ -2588,86 +2602,19 @@ def handle_change_detail() -> None:
     result = load_result(change_id)
     events = load_events(change_id)
     ai_calls = load_ai_calls(change_id)
-
-    running = state.get("status") in {"queued", "running"}
-    refresh = REFRESH_SECONDS if running else None
-    summary = f"Model {request.get('model')} with an AI budget of {request.get('ai_budget')} calls."
-    validation_command = request.get("validation_command", "") or "(pending generation)"
-    strategy_notes = str(request.get("strategy_notes", "")).strip()
-    strategy_html = f"<p><strong>Strategy notes:</strong> {e(strategy_notes)}</p>" if strategy_notes else ""
-    status_card = f"""
-<section class="card">
-  <h2>Request</h2>
-  <p>{e(request.get('description', ''))}</p>
-  {strategy_html}
-  <p><strong>Status:</strong> <span class="status-chip">{e(state.get('status', 'unknown'))}</span></p>
-  <p><strong>Current step:</strong> {e(state.get('current_step', ''))}</p>
-  <p><strong>Server root:</strong> <code>{e(request.get('server_root', ''))}</code></p>
-  <p><strong>Validation command:</strong> <code>{e(validation_command)}</code></p>
-  <p><a href="/">Start another change</a></p>
-</section>
-"""
-    pieces = [status_card]
-    if result.get("rolled_back_after_error"):
-        pieces.append(
-            """
-<section class="card">
-  <h2>Rollback</h2>
-  <p>Earlier approved edits were rolled back because a later subchange was rejected during review.</p>
-</section>
-"""
-        )
-    if result.get("validation_command_generation"):
-        pieces.append(render_validation_generation(change_id, result["validation_command_generation"]))
-    if result.get("risk_assessments"):
-        pieces.append(render_risk_assessments(change_id, result["risk_assessments"], state, request))
-    if "existing_evidence" in result:
-        evidence = result["existing_evidence"]
-        pieces.append(
-            f"""
-<section class="card">
-  <h2>Existing evidence</h2>
-  <p>{e(evidence.get('summary', ''))}</p>
-</section>
-"""
-        )
-    if result.get("validation_before"):
-        pieces.append(render_command_result(result["validation_before"], "Validation before changes"))
-    if result.get("context_items"):
-        pieces.append(
-            f"<section class=\"card\"><h2>Context used for the change</h2>{render_context_items(change_id, result['context_items'])}</section>"
-        )
-    if result.get("decomposition"):
-        pieces.append(render_decomposition(change_id, result["decomposition"]))
-    if result.get("review"):
-        review = result["review"]
-        issues = review.get("issues", [])
-        issues_html = "".join(f"<li>{e(issue)}</li>" for issue in issues) or "<li>No review issues were reported.</li>"
-        review_links = render_ai_call_links(change_id, [("View review request and response", review.get("ai_call_id", ""))])
-        pieces.append(
-            f"""
-<section class="card">
-  <h2>Review</h2>
-  <p>{e(review.get('summary', ''))}</p>
-  <p><strong>Approved:</strong> {e(review.get('approved', False))}</p>
-  {review_links}
-  <ul class="stack-list">{issues_html}</ul>
-</section>
-"""
-        )
-    if result.get("validation_after"):
-        pieces.append(render_command_result(result["validation_after"], "Validation after changes"))
-    if result.get("applied_changes"):
-        pieces.append(render_change_items(change_id, result["applied_changes"], "Applied changes"))
-    if result.get("attempted_changes"):
-        pieces.append(render_change_items(change_id, result["attempted_changes"], "Attempted changes"))
-    pieces.append(render_next_steps(change_id, result.get("next_steps", []), request))
-    pieces.append(render_ai_activity(change_id, ai_calls))
-    pieces.append(f"<section class=\"card\"><h2>Workflow events</h2>{render_events(events)}</section>")
-    if state.get("error"):
-        pieces.append(f"<section class=\"card\"><h2>Error</h2><pre>{e(state['error'])}</pre></section>")
-    response_headers()
-    print(html_page(f"Change {change_id}", "".join(piece for piece in pieces if piece), subtitle=summary, refresh_seconds=refresh))
+    status_value = state.get("status", "unknown")
+    emit_json(
+        {
+            "change_id": change_id,
+            "running": status_value in {"queued", "running"},
+            "poll_after_seconds": REFRESH_SECONDS if status_value in {"queued", "running"} else None,
+            "request": request,
+            "state": state,
+            "result": result,
+            "events": events,
+            "ai_calls": ai_calls,
+        }
+    )
 
 
 def handle_file_view() -> None:
@@ -2680,20 +2627,20 @@ def handle_file_view() -> None:
     line_start = int(start) if start.isdigit() else None
     line_end = int(end) if end.isdigit() else None
     selected_start, selected_end, snippet = slice_lines(text, line_start, line_end)
-    numbered = []
-    for number, line in enumerate(snippet.splitlines(), start=selected_start):
-        numbered.append(f"{number:>5} | {line}")
-    body = f"""
-<section class="card">
-  <h2>{e(relative)}</h2>
-  <p><strong>Server root:</strong> <code>{e(target_root())}</code></p>
-  <p><strong>Lines:</strong> {e(selected_start)}-{e(selected_end)}</p>
-  <pre>{e(chr(10).join(numbered) or '(empty file)')}</pre>
-  <p><a href="/">Back</a></p>
-</section>
-"""
-    response_headers()
-    print(html_page(relative, body, subtitle="Current filesystem view"))
+    numbered = [
+        {"line": number, "text": line}
+        for number, line in enumerate(snippet.splitlines(), start=selected_start)
+    ]
+    emit_json(
+        {
+            "path": relative,
+            "server_root": str(target_root()),
+            "line_start": selected_start,
+            "line_end": selected_end,
+            "text": snippet,
+            "numbered_lines": numbered,
+        }
+    )
 
 
 def handle_context_view() -> None:
@@ -2707,19 +2654,7 @@ def handle_context_view() -> None:
     items = result.get("context_items", [])
     if index < 0 or index >= len(items):
         raise AppError("Unknown context item.")
-    item = items[index]
-    body = f"""
-<section class="card">
-  <h2>{e(item['path'])}:{e(item['start_line'])}-{e(item['end_line'])}</h2>
-  <p><strong>Scope:</strong> {e(item.get('scope', ''))}</p>
-  <p><strong>Reason:</strong> {e(item.get('reason', ''))}</p>
-  <p><a href="{e(item['file_url'])}">Open current file directly</a></p>
-  <pre>{e(item.get('content', ''))}</pre>
-  <p><a href="/changes/{e(change_id)}">Back to change</a></p>
-</section>
-"""
-    response_headers()
-    print(html_page("Context item", body, subtitle="Stored context snapshot used by the workflow"))
+    emit_json({"change_id": change_id, "index": index, "item": items[index]})
 
 
 def handle_diff_view() -> None:
@@ -2733,19 +2668,7 @@ def handle_diff_view() -> None:
     items = result.get("applied_changes") or result.get("attempted_changes") or []
     if index < 0 or index >= len(items):
         raise AppError("Unknown change diff.")
-    item = items[index]
-    body = f"""
-<section class="card">
-  <h2>{e(item['path'])}</h2>
-  <p><strong>Action:</strong> {e(item['action'])}</p>
-  <p>{e(item['description'])}</p>
-  <p><a href="{e(item['file_url'])}">Open current file directly</a></p>
-  <pre>{e(item.get('diff', '(no diff available)'))}</pre>
-  <p><a href="/changes/{e(change_id)}">Back to change</a></p>
-</section>
-"""
-    response_headers()
-    print(html_page("Change diff", body, subtitle="Stored diff for this requested change"))
+    emit_json({"change_id": change_id, "index": index, "item": items[index]})
 
 
 def handle_ai_call_view() -> None:
@@ -2754,59 +2677,166 @@ def handle_ai_call_view() -> None:
     call_id = params.get("call", "")
     payload = load_ai_call_log(change_id, call_id)
     relative_log_path = str(payload.get("log_path", "")).strip()
-    raw_log_link = ""
     direct_log_path = served_app_path(relative_log_path)
-    if direct_log_path:
-        raw_log_link = f"<p><a href=\"{e(direct_log_path)}\">Open stored log file directly</a></p>"
-    elif relative_log_path and not relative_log_path.startswith("/"):
-        raw_log_link = f"<p><a href=\"{e(route_url('/file', path=relative_log_path))}\">Open stored log file</a></p>"
-    error_block = ""
-    if payload.get("error"):
-        error_block = f"<p><strong>Error:</strong> {e(payload.get('error', ''))}</p>"
-    body = f"""
-<section class="card">
-  <h2>AI call {e(call_id)}</h2>
-  <p><strong>Prompt:</strong> {e(payload.get('prompt', ''))}</p>
-  <p><strong>Model:</strong> <code>{e(payload.get('model', ''))}</code></p>
-  <p><strong>Timestamp:</strong> {e(payload.get('timestamp', ''))}</p>
-  <p><strong>Log path:</strong> <code>{e(relative_log_path or '(unknown)')}</code></p>
-  {error_block}
-  {raw_log_link}
-  <details open>
-    <summary>System prompt</summary>
-    <pre>{e(payload.get('system_prompt', ''))}</pre>
-  </details>
-  <details open>
-    <summary>User prompt</summary>
-    <pre>{e(payload.get('user_prompt', ''))}</pre>
-  </details>
-  <details open>
-    <summary>Request</summary>
-    <pre>{e(json_pretty(payload.get('request', {})))}</pre>
-  </details>
-  <details open>
-    <summary>Response</summary>
-    <pre>{e(json_pretty(payload.get('response', {})))}</pre>
-  </details>
-  <details open>
-    <summary>Assistant message</summary>
-    <pre>{e(payload.get('assistant_message', ''))}</pre>
-  </details>
-  <p><a href="/changes/{e(change_id)}">Back to change</a></p>
-</section>
-"""
-    response_headers()
-    print(html_page("AI call log", body, subtitle="Exact saved request and response for this OpenRouter call"))
+    fallback_log_path = ""
+    if not direct_log_path and relative_log_path and not relative_log_path.startswith("/"):
+        fallback_log_path = route_url("/file", path=relative_log_path)
+    emit_json(
+        {
+            "change_id": change_id,
+            "call_id": call_id,
+            "log_path": relative_log_path,
+            "direct_log_path": direct_log_path,
+            "fallback_log_path": fallback_log_path,
+            "payload": payload,
+        }
+    )
+
+
+def handle_change_artifact_view() -> None:
+    change_id = os.environ.get("PARAM_ID", "")
+    params = query_params()
+    kind = (params.get("kind") or params.get("type") or "result").strip().lower()
+
+    if kind == "request":
+        emit_json({"change_id": change_id, "kind": kind, "data": load_request(change_id)})
+        return
+    if kind == "state":
+        emit_json({"change_id": change_id, "kind": kind, "data": load_state(change_id)})
+        return
+    if kind == "result":
+        emit_json({"change_id": change_id, "kind": kind, "data": load_result(change_id)})
+        return
+    if kind == "events":
+        emit_json({"change_id": change_id, "kind": kind, "data": load_events(change_id)})
+        return
+    if kind == "ai_calls":
+        emit_json({"change_id": change_id, "kind": kind, "data": load_ai_calls(change_id)})
+        return
+    if kind == "context":
+        result = load_result(change_id)
+        items = result.get("context_items", [])
+        try:
+            index = int(params.get("index", "0"))
+        except ValueError:
+            index = 0
+        if index < 0 or index >= len(items):
+            raise AppError("Unknown context artifact index.")
+        emit_json({"change_id": change_id, "kind": kind, "index": index, "data": items[index]})
+        return
+    if kind == "diff":
+        result = load_result(change_id)
+        items = result.get("applied_changes") or result.get("attempted_changes") or []
+        try:
+            index = int(params.get("index", "0"))
+        except ValueError:
+            index = 0
+        if index < 0 or index >= len(items):
+            raise AppError("Unknown diff artifact index.")
+        emit_json({"change_id": change_id, "kind": kind, "index": index, "data": items[index]})
+        return
+    if kind in {"ai_call", "aicall"}:
+        call_id = params.get("call", "").strip()
+        if not call_id:
+            raise AppError("The call query parameter is required for ai_call artifacts.")
+        emit_json({"change_id": change_id, "kind": "ai_call", "data": load_ai_call_log(change_id, call_id)})
+        return
+    raise AppError(
+        "Unknown artifact kind. Use one of: request, state, result, events, ai_calls, context, diff, ai_call."
+    )
+
+
+def handle_change_validation_post() -> None:
+    change_id = os.environ.get("PARAM_ID", "")
+    request = load_request(change_id)
+    state = load_state(change_id)
+    result = load_result(change_id)
+    status_value = state.get("status", "unknown")
+    if status_value in {"queued", "running"}:
+        emit_json(
+            {"error": "change_in_progress", "message": "The change is already running.", "change_id": change_id},
+            status=400,
+        )
+    if status_value == "awaiting_risk_review":
+        emit_json(
+            {
+                "error": "risk_review_required",
+                "message": "Handle risk review first with POST /changes/:id and action ignore_risk or revise_strategy.",
+                "change_id": change_id,
+            },
+            status=400,
+        )
+    queue_change_retry(
+        change_id,
+        request,
+        state,
+        result,
+        message="Manual validation rerun requested through /changes/:id/validation.",
+    )
+    spawn_worker(change_id)
+    emit_json(
+        {
+            "status": "queued",
+            "change_id": change_id,
+            "previous_status": status_value,
+            "message": "Validation rerun queued.",
+            "poll_after_seconds": REFRESH_SECONDS,
+        }
+    )
+
+
+def handle_change_recovery_post() -> None:
+    change_id = os.environ.get("PARAM_ID", "")
+    request = load_request(change_id)
+    state = load_state(change_id)
+    result = load_result(change_id)
+    status_value = state.get("status", "unknown")
+    if status_value not in {"rolled_back", "validation_failed", "error"}:
+        emit_json(
+            {
+                "error": "recovery_not_available",
+                "message": f"Recovery is only available for rolled_back, validation_failed, or error states (got {status_value}).",
+                "change_id": change_id,
+            },
+            status=400,
+        )
+    params = form_params()
+    strategy_notes = params.get("strategy_notes", "").strip()
+    if strategy_notes:
+        request["strategy_notes"] = strategy_notes
+        request["allow_high_risk_strategy"] = False
+        request["risk_override_at"] = ""
+    queue_change_retry(
+        change_id,
+        request,
+        state,
+        result,
+        message="Manual recovery queued through /changes/:id/recovery.",
+    )
+    spawn_worker(change_id)
+    emit_json(
+        {
+            "status": "queued",
+            "change_id": change_id,
+            "previous_status": status_value,
+            "message": "Recovery queued.",
+            "strategy_notes": request.get("strategy_notes", ""),
+            "poll_after_seconds": REFRESH_SECONDS,
+        }
+    )
 
 
 def render_error_page(err: Exception) -> None:
-    response_headers(status=500)
-    print(
-        html_page(
-            "Error",
-            f"<section class=\"card\"><p>{e(str(err))}</p><pre>{e(traceback.format_exc())}</pre><p><a href=\"/\">Back</a></p></section>",
-            subtitle="The example app hit an unexpected error.",
-        )
+    if isinstance(err, AppError):
+        emit_json({"error": "bad_request", "message": str(err)}, status=400)
+        return
+    emit_json(
+        {
+            "error": "internal_error",
+            "message": str(err),
+            "traceback": traceback.format_exc(),
+        },
+        status=500,
     )
 
 

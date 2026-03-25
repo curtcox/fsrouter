@@ -215,6 +215,8 @@ This example demonstrates the intended usage pattern: the route directory
 (`examples/ai`) is served directly, so ordinary files are reachable at their
 corresponding URL paths. Custom executable handlers are added only for derived
 views (workflow state, snapshots, diffs) that don't correspond to static files.
+Because executable handlers no longer emit CGI-style headers, this example's
+dynamic routes return JSON and rely on exit-code status mapping per the spec.
 
 - Run:
 

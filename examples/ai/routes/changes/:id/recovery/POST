@@ -9,11 +9,11 @@ for parent in current.parents:
         sys.path.insert(0, str(parent / "lib"))
         break
 
-from ai_change_app import handle_preferences_post, render_error_page
+from ai_change_app import handle_change_recovery_post, render_error_page
 
 
 if __name__ == "__main__":
     try:
-        handle_preferences_post()
+        handle_change_recovery_post()
     except Exception as err:  # pragma: no cover - handler surface
         render_error_page(err)
