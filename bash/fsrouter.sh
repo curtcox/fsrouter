@@ -417,79 +417,6 @@ run_handler() {
   rm -f "$env_script"
 }
 
-parse_cgi_response() {
-  local raw_file="$1"
-  CGI_STATUS="$2"
-  CGI_CONTENT_TYPE='application/json'
-  CGI_BODY_FILE=$(mktemp)
-  CGI_HEADERS_FILE=$(mktemp)
-  python3 -c 'import sys
-raw_path, body_path, headers_path, default_status = sys.argv[1:5]
-raw = open(raw_path, "rb").read()
-status = int(default_status)
-content_type = "application/json"
-headers = []
-body = raw
-pos = 0
-saw_blank = False
-parsed = False
-if raw:
-    while pos < len(raw):
-        newline = raw.find(b"\n", pos)
-        if newline == -1:
-            line = raw[pos:]
-            next_pos = len(raw)
-        else:
-            line = raw[pos:newline]
-            next_pos = newline + 1
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        if line == b"":
-            saw_blank = True
-            pos = next_pos
-            parsed = True
-            break
-        try:
-            text = line.decode("utf-8")
-        except UnicodeDecodeError:
-            parsed = False
-            break
-        if ":" not in text:
-            parsed = False
-            break
-        key, value = text.split(":", 1)
-        if not key or any(ord(ch) <= 32 or ord(ch) == 127 for ch in key):
-            parsed = False
-            break
-        value = value.strip()
-        low = key.lower()
-        if low == "status":
-            first = value.split()
-            if first:
-                try:
-                    status = int(first[0])
-                except ValueError:
-                    pass
-        elif low == "content-type":
-            content_type = value
-        else:
-            headers.append((key, value))
-        pos = next_pos
-    if parsed and saw_blank:
-        body = raw[pos:]
-with open(body_path, "wb") as fh:
-    fh.write(body)
-with open(headers_path, "w", encoding="utf-8") as fh:
-    for key, value in headers:
-        fh.write(f"{key}: {value}\n")
-print(status)
-print(content_type)
-print(1 if parsed and saw_blank else 0)' "$raw_file" "$CGI_BODY_FILE" "$CGI_HEADERS_FILE" "$CGI_STATUS" > "$CGI_BODY_FILE.meta"
-  CGI_STATUS=$(sed -n '1p' "$CGI_BODY_FILE.meta")
-  CGI_CONTENT_TYPE=$(sed -n '2p' "$CGI_BODY_FILE.meta")
-  rm -f "$CGI_BODY_FILE.meta"
-}
-
 serve_static() {
   local response_file="$1"
   local method="$2"
@@ -554,60 +481,22 @@ serve_executable_fallback() {
     printf '502'
     return
   fi
-  local raw_for_parse
-  raw_for_parse="$HANDLER_STDOUT_FILE"
-  if [[ ! -s "$raw_for_parse" && "$HANDLER_EXIT_CODE" != '0' && -s "$HANDLER_STDERR_FILE" ]]; then
-    raw_for_parse="$HANDLER_STDERR_FILE"
+  local status body_file extra_headers
+  status=$(exit_to_status "$HANDLER_EXIT_CODE")
+  body_file="$HANDLER_STDOUT_FILE"
+  if [[ ! -s "$body_file" && "$HANDLER_EXIT_CODE" != '0' && -s "$HANDLER_STDERR_FILE" ]]; then
+    body_file="$HANDLER_STDERR_FILE"
   fi
-  parse_cgi_response "$raw_for_parse" "$(exit_to_status "$HANDLER_EXIT_CODE")"
-  write_response_file "$response_file" "$request_method" "$CGI_STATUS" "$CGI_CONTENT_TYPE" "$CGI_BODY_FILE" "$CGI_HEADERS_FILE"
-  if [[ -s "$HANDLER_STDERR_FILE" ]]; then
-    local stderr_text
-    stderr_text=$(tr -d '\r' < "$HANDLER_STDERR_FILE" | tr '\n' ' ')
-    printf '  [handler stderr] %s\n' "$stderr_text" >&2
-  fi
-  rm -f "$CGI_BODY_FILE" "$CGI_HEADERS_FILE" "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
-  printf '%s' "$CGI_STATUS"
-}
-
-serve_executable_plain_file() {
-  local response_file="$1"
-  local handler_path="$2"
-  local request_body_file="$3"
-  local request_method="$4"
-  local request_target="$5"
-  local request_path="$6"
-  local query_string="$7"
-  local content_type="$8"
-  local content_length="$9"
-  local peer="${10}"
-  local host_header="${11}"
-  local listen_addr="${12}"
-  local timeout_seconds="${13}"
-  run_handler "$handler_path" "$request_body_file" "$request_method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
-  if (( HANDLER_EXIT_CODE == 142 || HANDLER_EXIT_CODE == 124 )); then
-    write_json_response_file "$response_file" "$request_method" 504 "{\"error\":\"handler_timeout\",\"timeout_seconds\":$timeout_seconds}"
-    rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
-    printf '504'
-    return
-  fi
-  if (( HANDLER_EXIT_CODE == 127 )); then
-    write_json_response_file "$response_file" "$request_method" 502 '{"error":"exec_failed","message":"exec_failed"}'
-    rm -f "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
-    printf '502'
-    return
-  fi
-  local extra_headers
   extra_headers=$(mktemp)
   : > "$extra_headers"
-  write_response_file "$response_file" "$request_method" "$(exit_to_status "$HANDLER_EXIT_CODE")" 'text/plain' "$HANDLER_STDOUT_FILE" "$extra_headers"
+  write_response_file "$response_file" "$request_method" "$status" 'application/json' "$body_file" "$extra_headers"
   if [[ -s "$HANDLER_STDERR_FILE" ]]; then
     local stderr_text
     stderr_text=$(tr -d '\r' < "$HANDLER_STDERR_FILE" | tr '\n' ' ')
     printf '  [handler stderr] %s\n' "$stderr_text" >&2
   fi
   rm -f "$extra_headers" "$HANDLER_STDOUT_FILE" "$HANDLER_STDERR_FILE"
-  printf '%s' "$(exit_to_status "$HANDLER_EXIT_CODE")"
+  printf '%s' "$status"
 }
 
 serve_dir_listing() {
@@ -665,14 +554,14 @@ serve_filesystem_fallback() {
   if [[ -d "$fallback" ]]; then
     if find_directory_index "$fallback"; then
       if [[ -x "$DIRECTORY_INDEX_PATH" ]]; then
-        serve_executable_plain_file "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+        serve_executable_fallback "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
         return
       fi
       if [[ "$DIRECTORY_INDEX_KIND" == 'static' ]]; then
         serve_static "$response_file" "$method" "$DIRECTORY_INDEX_PATH"
         return
       fi
-      serve_executable_plain_file "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+      serve_executable_fallback "$response_file" "$DIRECTORY_INDEX_PATH" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
       return
     fi
     serve_dir_listing "$response_file" "$method" "$fallback" "$request_path"
@@ -680,7 +569,7 @@ serve_filesystem_fallback() {
   fi
   if [[ -f "$fallback" ]]; then
     if [[ -x "$fallback" ]]; then
-      serve_executable_plain_file "$response_file" "$fallback" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
+      serve_executable_fallback "$response_file" "$fallback" "$request_body_file" "$method" "$request_target" "$request_path" "$query_string" "$content_type" "$content_length" "$peer" "$host_header" "$listen_addr" "$timeout_seconds"
       return
     fi
     serve_static "$response_file" "$method" "$fallback"

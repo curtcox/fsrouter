@@ -16,28 +16,21 @@
 //
 // Conventions:
 //   - Files named GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS are handlers.
-//   - Executable handlers are invoked as subprocesses (CGI-style).
+//   - Executable handlers are invoked as subprocesses.
 //   - Non-executable handler files are served as static content.
 //   - Directories starting with ":" are path parameters.
 //   - Literal path segments take priority over parameter segments.
 //
 // Handler subprocess protocol:
 //   - stdin:   request body
-//   - stdout:  response (optional CGI headers + body, see below)
+//   - stdout:  response body (always used verbatim, no header parsing)
 //   - stderr:  logged server-side; used as response body on error if stdout is empty
 //   - cwd:     set to the handler file's parent directory
 //   - env:     inherits server env plus CGI-like variables (see buildEnv)
 //
-// CGI-style response headers (optional):
-//   If the handler's stdout starts with lines that look like HTTP headers
-//   ("Key: Value\n") followed by a blank line, they are parsed:
-//     Status: 201         → sets HTTP status code
-//     Content-Type: ...   → sets content type
-//     X-Custom: ...       → set as response header
-//   If no headers are detected, the entire stdout is the response body.
-//
-// Exit code mapping (when no Status header is set):
-//   0 → 200    1 → 400 (client error)    other → 500
+// Response:
+//   Content-Type is always application/json.
+//   HTTP status is derived from the exit code: 0 → 200, 1 → 400, other → 500.
 //
 // Environment variables for configuration:
 //   ROUTE_DIR        path to routes directory  (default: ./routes)
@@ -47,7 +40,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -343,7 +335,7 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request, path string, par
 		body = stderr.Bytes()
 	}
 
-	return writeCGIResponse(w, body, exitCode)
+	return writeHandlerResponse(w, body, exitCode)
 }
 
 func (s *server) executePlainFile(w http.ResponseWriter, r *http.Request, path string) int {
@@ -380,97 +372,27 @@ func (s *server) executePlainFile(w http.ResponseWriter, r *http.Request, path s
 		log.Printf("  [handler stderr] %s", strings.TrimRight(stderr.String(), "\n"))
 	}
 
+	// If the handler produced no stdout on failure, fall back to stderr.
 	body := stdout.Bytes()
-	status := exitToStatus(exitCode)
-	w.Header().Set("Content-Type", "text/plain")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(status)
-	if r.Method != "HEAD" {
-		w.Write(body)
+	if len(body) == 0 && exitCode != 0 && stderr.Len() > 0 {
+		body = stderr.Bytes()
 	}
-	return status
+
+	return writeHandlerResponse(w, body, exitCode)
 }
 
 // ---------------------------------------------------------------------------
-// CGI response parsing
+// Handler response writing
 // ---------------------------------------------------------------------------
 
-// writeCGIResponse inspects the handler output for optional CGI-style headers.
-// If the output starts with valid header lines followed by a blank line, those
-// lines are parsed as response headers. Otherwise the entire output is the body.
-func writeCGIResponse(w http.ResponseWriter, raw []byte, exitCode int) int {
-	// Defaults.
+// writeHandlerResponse writes the handler's stdout as the response body with
+// Content-Type application/json and an HTTP status derived from the exit code.
+func writeHandlerResponse(w http.ResponseWriter, body []byte, exitCode int) int {
 	status := exitToStatus(exitCode)
-	contentType := "application/json"
-	body := raw
-	headersParsed := false
-
-	if len(raw) > 0 && looksLikeHeader(raw) {
-		sc := bufio.NewScanner(bytes.NewReader(raw))
-		consumed := 0
-		for sc.Scan() {
-			line := sc.Text()
-			consumed += len(line) + 1 // approximate; accounts for \n
-
-			if line == "" {
-				// Blank line terminates headers.
-				headersParsed = true
-				break
-			}
-
-			key, val, ok := parseHeaderLine(line)
-			if !ok {
-				break // not a header → treat everything as body
-			}
-			switch strings.ToLower(key) {
-			case "status":
-				if code, err := strconv.Atoi(strings.Fields(val)[0]); err == nil {
-					status = code
-				}
-			case "content-type":
-				contentType = val
-			default:
-				w.Header().Set(key, val)
-			}
-		}
-		if headersParsed {
-			body = raw[consumed:]
-		}
-	}
-
-	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(body)
 	return status
-}
-
-// looksLikeHeader returns true if the first line of b matches "Token:".
-func looksLikeHeader(b []byte) bool {
-	for i, c := range b {
-		switch {
-		case c == ':' && i > 0:
-			return true
-		case c == '\n', c == '\r':
-			return false
-		case c == ' ' || c == '\t':
-			return false // spaces before colon → not a header
-		}
-	}
-	return false
-}
-
-func parseHeaderLine(line string) (string, string, bool) {
-	i := strings.IndexByte(line, ':')
-	if i <= 0 {
-		return "", "", false
-	}
-	key := line[:i]
-	for _, c := range key {
-		if c <= ' ' || c == 127 {
-			return "", "", false
-		}
-	}
-	return key, strings.TrimSpace(line[i+1:]), true
 }
 
 func exitToStatus(code int) int {

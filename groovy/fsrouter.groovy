@@ -79,13 +79,6 @@ class ExchangeContext {
     String listenAddr
 }
 
-class HeaderParseResult {
-    int status
-    String contentType
-    List<Map.Entry<String, String>> headers
-    byte[] body
-}
-
 String envOr(String key, String fallback) {
     String value = System.getenv(key)
     value == null || value.isEmpty() ? fallback : value
@@ -300,82 +293,6 @@ int exitToStatus(int code) {
     500
 }
 
-boolean looksLikeHeader(byte[] raw) {
-    for (byte b : raw) {
-        if (b == ((byte) ':')) {
-            return true
-        }
-        if (b == ((byte) '\n') || b == ((byte) '\r') || b == ((byte) ' ') || b == ((byte) '\t')) {
-            return false
-        }
-    }
-    false
-}
-
-Map.Entry<String, String> parseHeaderLine(String line) {
-    int idx = line.indexOf(':')
-    if (idx <= 0) {
-        return null
-    }
-    String key = line.substring(0, idx)
-    for (int i = 0; i < key.length(); i++) {
-        char ch = key.charAt(i)
-        if (ch <= 32 || ch == 127) {
-            return null
-        }
-    }
-    new AbstractMap.SimpleEntry<>(key, line.substring(idx + 1).trim())
-}
-
-HeaderParseResult parseCgiHeaders(byte[] raw, int defaultStatus) {
-    int status = defaultStatus
-    String contentType = 'application/json'
-    List<Map.Entry<String, String>> headers = []
-    int pos = 0
-    boolean sawBlank = false
-
-    while (pos < raw.length) {
-        int newline = pos
-        while (newline < raw.length && raw[newline] != ((byte) '\n')) {
-            newline++
-        }
-        byte[] line = Arrays.copyOfRange(raw, pos, newline)
-        int nextPos = newline < raw.length ? newline + 1 : raw.length
-        if (line.length > 0 && line[line.length - 1] == ((byte) '\r')) {
-            line = Arrays.copyOfRange(line, 0, line.length - 1)
-        }
-        if (line.length == 0) {
-            sawBlank = true
-            pos = nextPos
-            break
-        }
-        String text = new String(line, StandardCharsets.UTF_8)
-        Map.Entry<String, String> parsed = parseHeaderLine(text)
-        if (parsed == null) {
-            return null
-        }
-        if (parsed.key.equalsIgnoreCase('Status')) {
-            String[] parts = parsed.value.split(/\s+/)
-            if (parts.length > 0) {
-                try {
-                    status = Integer.parseInt(parts[0])
-                } catch (NumberFormatException ignored) {
-                }
-            }
-        } else if (parsed.key.equalsIgnoreCase('Content-Type')) {
-            contentType = parsed.value
-        } else {
-            headers << parsed
-        }
-        pos = nextPos
-    }
-
-    if (!sawBlank) {
-        return null
-    }
-    new HeaderParseResult(status: status, contentType: contentType, headers: headers, body: Arrays.copyOfRange(raw, pos, raw.length))
-}
-
 byte[] readAllBytes(InputStream input) {
     ByteArrayOutputStream out = new ByteArrayOutputStream()
     byte[] buffer = new byte[8192]
@@ -415,27 +332,10 @@ int writeJson(HttpExchange exchange, String method, int status, Map payload) {
     status
 }
 
-int writeCgiResponse(HttpExchange exchange, String method, byte[] raw, int exitCode) {
+int writeExecResponse(HttpExchange exchange, String method, byte[] body, int exitCode) {
     int status = exitToStatus(exitCode)
-    String contentType = 'application/json'
-    List<Map.Entry<String, String>> headers = []
-    byte[] body = raw
-
-    if (raw.length > 0 && looksLikeHeader(raw)) {
-        HeaderParseResult parsed = parseCgiHeaders(raw, status)
-        if (parsed != null) {
-            status = parsed.status
-            contentType = parsed.contentType
-            headers = parsed.headers
-            body = parsed.body
-        }
-    }
-
     Headers responseHeaders = exchange.responseHeaders
-    headers.each { Map.Entry<String, String> header ->
-        responseHeaders.add(header.key, header.value)
-    }
-    responseHeaders.set('Content-Type', contentType)
+    responseHeaders.set('Content-Type', 'application/json')
     responseHeaders.set('Content-Length', Integer.toString(body.length))
     sendResponse(exchange, method, status, body)
     status
@@ -619,75 +519,15 @@ int handleHandler(HttpExchange exchange, String method, Path handlerPath, Map<St
         System.err.flush()
     }
 
-    byte[] raw = stdout
-    if (raw.length == 0 && exitCode != 0 && stderr.length > 0) {
-        raw = stderr
+    byte[] body = stdout
+    if (body.length == 0 && exitCode != 0 && stderr.length > 0) {
+        body = stderr
     }
-    writeCgiResponse(exchange, method, raw, exitCode)
+    writeExecResponse(exchange, method, body, exitCode)
 }
 
 int executePlainFile(HttpExchange exchange, String method, Path handlerPath, int timeoutSeconds, String listenAddr) {
-    byte[] requestBody = readAllBytes(exchange.requestBody)
-    Map<String, String> env = buildEnv(new ExchangeContext(method: method, uri: exchange.requestURI, headers: exchange.requestHeaders, remoteAddress: exchange.remoteAddress, listenAddr: listenAddr), [:])
-
-    Process process
-    try {
-        ProcessBuilder builder = new ProcessBuilder(handlerPath.toString())
-        builder.directory(handlerPath.parent.toFile())
-        builder.environment().clear()
-        builder.environment().putAll(env)
-        process = builder.start()
-    } catch (IOException err) {
-        return writeJson(exchange, method, 502, [error: 'exec_failed', message: err.message])
-    }
-
-    ExecutorService ioExecutor = Executors.newFixedThreadPool(2)
-    Future<byte[]> stdoutFuture = ioExecutor.submit(readStream(process.inputStream))
-    Future<byte[]> stderrFuture = ioExecutor.submit(readStream(process.errorStream))
-    process.outputStream.withCloseable { OutputStream stdin ->
-        stdin.write(requestBody)
-    }
-
-    byte[] stdout
-    byte[] stderr
-    int exitCode
-    try {
-        boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
-        if (!finished) {
-            process.destroyForcibly()
-            process.waitFor(1, TimeUnit.SECONDS)
-            stdoutFuture.cancel(true)
-            stderrFuture.cancel(true)
-            ioExecutor.shutdownNow()
-            return writeJson(exchange, method, 504, [error: 'handler_timeout', timeout_seconds: timeoutSeconds])
-        }
-        exitCode = process.exitValue()
-        stdout = stdoutFuture.get()
-        stderr = stderrFuture.get()
-    } catch (InterruptedException err) {
-        Thread.currentThread().interrupt()
-        process.destroyForcibly()
-        ioExecutor.shutdownNow()
-        return writeJson(exchange, method, 500, [error: 'exec_failed', message: err.message])
-    } catch (ExecutionException err) {
-        process.destroyForcibly()
-        ioExecutor.shutdownNow()
-        Throwable cause = err.cause == null ? err : err.cause
-        return writeJson(exchange, method, 500, [error: 'exec_failed', message: cause.message == null ? cause.toString() : cause.message])
-    } finally {
-        ioExecutor.shutdownNow()
-    }
-
-    if (stderr.length > 0) {
-        System.err.printf('  [handler stderr] %s%n', new String(stderr, StandardCharsets.UTF_8).replaceFirst(/[\r\n]+$/, ''))
-        System.err.flush()
-    }
-
-    Headers headers = exchange.responseHeaders
-    headers.set('Content-Type', 'text/plain')
-    headers.set('Content-Length', Integer.toString(stdout.length))
-    sendResponse(exchange, method, exitToStatus(exitCode), stdout)
-    exitToStatus(exitCode)
+    return handleHandler(exchange, method, handlerPath, [:], timeoutSeconds, listenAddr)
 }
 
 void logResult(String method, String path, int status, long startNanos) {

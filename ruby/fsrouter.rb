@@ -168,60 +168,6 @@ def build_env(req, server, params)
   env
 end
 
-def looks_like_header(raw)
-  raw.each_byte.with_index do |byte, idx|
-    return true if byte == ':'.ord && idx.positive?
-    return false if ["\n".ord, "\r".ord, ' '.ord, "\t".ord].include?(byte)
-  end
-  false
-end
-
-def parse_header_line(line)
-  idx = line.index(':')
-  return nil unless idx && idx.positive?
-
-  key = line[0...idx]
-  return nil if key.each_char.any? { |ch| ch.ord <= 32 || ch.ord == 127 }
-
-  [key, line[(idx + 1)..].strip]
-end
-
-def parse_cgi_headers(raw, default_status)
-  status = default_status
-  content_type = 'application/json'
-  headers = []
-  body_index = nil
-  lines = raw.split(/\n/, -1)
-  offset = 0
-
-  lines.each do |line|
-    consumed = line.bytesize + 1
-    line = line.delete_suffix("\r")
-    if line.empty?
-      body_index = offset + consumed
-      break
-    end
-
-    parsed = parse_header_line(line.force_encoding('UTF-8'))
-    return nil unless parsed
-
-    key, value = parsed
-    if key.downcase == 'status'
-      first = value.split.first
-      status = first.to_i if first && first.match?(/^\d+$/)
-    elsif key.downcase == 'content-type'
-      content_type = value
-    else
-      headers << [key, value]
-    end
-    offset += consumed
-  end
-
-  return nil unless body_index
-
-  [status, content_type, headers, raw.byteslice(body_index..) || '']
-end
-
 def exit_to_status(code)
   return 200 if code == 0
   return 400 if code == 1
@@ -249,69 +195,8 @@ rescue StandardError => e
   500
 end
 
-def execute_plain_file(req, res, server, handler_path)
-  env = build_env(req, server, {})
-  body = req.body || ''
-  stdout = ''
-  stderr = ''
-  status = nil
-  wait_thr = nil
-  pid = nil
-
-  begin
-    Open3.popen3(env, handler_path, chdir: File.dirname(handler_path)) do |stdin, out, err, thr|
-      wait_thr = thr
-      pid = thr.pid
-      stdin.binmode
-      out.binmode
-      err.binmode
-      stdin.write(body)
-      stdin.close
-      begin
-        Timeout.timeout(server[:command_timeout]) do
-          stdout_reader = Thread.new { out.read }
-          stderr_reader = Thread.new { err.read }
-          status = thr.value
-          stdout = stdout_reader.value
-          stderr = stderr_reader.value
-        end
-      rescue Timeout::Error
-        begin
-          Process.kill('TERM', pid)
-        rescue StandardError
-        end
-        begin
-          Timeout.timeout(1) { thr.value }
-        rescue StandardError
-          begin
-            Process.kill('KILL', pid)
-          rescue StandardError
-          end
-        end
-        json_response(res, req, 504, { error: 'handler_timeout', timeout_seconds: server[:command_timeout] })
-        return 504
-      end
-    end
-  rescue Errno::ENOENT, Errno::EACCES => e
-    json_response(res, req, 502, { error: 'exec_failed', message: e.message })
-    return 502
-  end
-
-  unless stderr.empty?
-    $stderr.puts("  [handler stderr] #{stderr.encode('UTF-8', invalid: :replace, undef: :replace).rstrip}")
-    $stderr.flush
-  end
-
-  body_out = stdout
-  res.status = exit_to_status(status&.exitstatus || 0)
-  res['Content-Type'] = 'text/plain'
-  res['Content-Length'] = body_out.bytesize.to_s
-  res.body = req.request_method == 'HEAD' ? '' : body_out
-  res.status
-end
-
 def serve_fallback_file(req, res, server_config, path)
-  return execute_plain_file(req, res, server_config, path) if is_executable(path)
+  return execute_handler(req, res, server_config, path, {}) if is_executable(path)
 
   serve_static(req, res, path)
 rescue StandardError => e
@@ -373,30 +258,14 @@ def execute_handler(req, res, server, handler_path, params)
   end
 
   exit_code = status&.exitstatus || 0
-  raw = stdout
-  raw = stderr if raw.empty? && exit_code != 0 && !stderr.empty?
-  write_cgi_response(req, res, raw, exit_code)
-end
+  body_out = stdout
+  body_out = stderr if body_out.empty? && exit_code != 0 && !stderr.empty?
 
-def write_cgi_response(req, res, raw, exit_code)
-  status = exit_to_status(exit_code)
-  content_type = 'application/json'
-  headers = []
-  body = raw
-
-  if !raw.empty? && looks_like_header(raw)
-    parsed = parse_cgi_headers(raw, status)
-    if parsed
-      status, content_type, headers, body = parsed
-    end
-  end
-
-  res.status = status
-  headers.each { |key, value| res[key] = value }
-  res['Content-Type'] = content_type
-  res['Content-Length'] = body.bytesize.to_s
-  res.body = req.request_method == 'HEAD' ? '' : body
-  status
+  res.status = exit_to_status(exit_code)
+  res['Content-Type'] = 'application/json'
+  res['Content-Length'] = body_out.bytesize.to_s
+  res.body = req.request_method == 'HEAD' ? '' : body_out
+  res.status
 end
 
 def handle_handler(req, res, server, handler_path, params)

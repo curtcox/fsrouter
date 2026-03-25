@@ -248,74 +248,6 @@ sub exit_to_status {
     return 500;
 }
 
-sub looks_like_header {
-    my ($raw) = @_;
-    for my $i (0 .. length($raw) - 1) {
-        my $ch = substr($raw, $i, 1);
-        return 1 if $ch eq ':' && $i > 0;
-        return 0 if $ch eq "\n" || $ch eq "\r" || $ch eq ' ' || $ch eq "\t";
-    }
-    return 0;
-}
-
-sub parse_header_line {
-    my ($line) = @_;
-    return if $line !~ /^([^:]+):\s*(.*)$/;
-    my ($key, $value) = ($1, $2);
-    for my $ch (split //, $key) {
-        my $ord = ord($ch);
-        return if $ord <= 32 || $ord == 127;
-    }
-    return ($key, $value);
-}
-
-sub parse_cgi_headers {
-    my ($raw, $default_status) = @_;
-    my $status = $default_status;
-    my $content_type = 'application/json';
-    my @headers;
-    my $pos = 0;
-    my $saw_blank = 0;
-
-    while ($pos < length($raw)) {
-        my $newline = index($raw, "\n", $pos);
-        my ($line, $next_pos);
-        if ($newline == -1) {
-            $line = substr($raw, $pos);
-            $next_pos = length($raw);
-        } else {
-            $line = substr($raw, $pos, $newline - $pos);
-            $next_pos = $newline + 1;
-        }
-        $line =~ s/\r$//;
-        if ($line eq '') {
-            $saw_blank = 1;
-            $pos = $next_pos;
-            last;
-        }
-        my ($key, $value) = parse_header_line($line);
-        return if !defined $key;
-        if (lc($key) eq 'status') {
-            if ($value =~ /^(\d+)/) {
-                $status = int($1);
-            }
-        } elsif (lc($key) eq 'content-type') {
-            $content_type = $value;
-        } else {
-            push @headers, [$key, $value];
-        }
-        $pos = $next_pos;
-    }
-
-    return if !$saw_blank;
-    return {
-        status => $status,
-        content_type => $content_type,
-        headers => \@headers,
-        body => substr($raw, $pos),
-    };
-}
-
 sub content_type_for {
     my ($path) = @_;
     if ($path =~ /(\.[^.\/]+)$/) {
@@ -440,11 +372,6 @@ sub json_escape {
     return $value;
 }
 
-sub is_array_ref {
-    my ($value) = @_;
-    return 0 if ref($value) ne 'ARRAY';
-    return 1;
-}
 
 sub json_encode {
     my ($value) = @_;
@@ -472,28 +399,6 @@ sub write_json {
     return $status;
 }
 
-sub write_cgi_response {
-    my ($client, $method, $raw, $exit_code) = @_;
-    my $status = exit_to_status($exit_code);
-    my $content_type = 'application/json';
-    my %headers;
-    my $body = $raw;
-    if (length($raw) > 0 && looks_like_header($raw)) {
-        my $parsed = parse_cgi_headers($raw, $status);
-        if (defined $parsed) {
-            $status = $parsed->{status};
-            $content_type = $parsed->{content_type};
-            for my $item (@{ $parsed->{headers} }) {
-                $headers{$item->[0]} = $item->[1];
-            }
-            $body = $parsed->{body};
-        }
-    }
-    $headers{'Content-Type'} = $content_type;
-    send_response($client, $method, $status, \%headers, $body);
-    return $status;
-}
-
 sub serve_static {
     my ($client, $method, $handler_path) = @_;
     my $data = eval { read_file($handler_path) };
@@ -504,9 +409,9 @@ sub serve_static {
     return 200;
 }
 
-sub execute_plain_file {
-    my ($client, $request, $handler_path, $timeout_seconds, $listen_addr) = @_;
-    my $env = build_env($request, {}, $listen_addr);
+sub execute_handler {
+    my ($client, $request, $handler_path, $params, $timeout_seconds, $listen_addr) = @_;
+    my $env = build_env($request, $params, $listen_addr);
     my $result = run_handler($handler_path, $request->{body}, $env, $timeout_seconds);
     if ($result->{timed_out}) {
         return write_json($client, $request->{method}, 504, { error => 'handler_timeout', timeout_seconds => $timeout_seconds });
@@ -520,8 +425,13 @@ sub execute_plain_file {
         print STDERR "  [handler stderr] $stderr\n";
         STDERR->flush();
     }
-    send_response($client, $request->{method}, exit_to_status($result->{exit_code}), { 'Content-Type' => 'text/plain' }, $result->{stdout});
-    return exit_to_status($result->{exit_code});
+    my $body = $result->{stdout};
+    if ($body eq '' && $result->{exit_code} != 0 && $result->{stderr} ne '') {
+        $body = $result->{stderr};
+    }
+    my $status = exit_to_status($result->{exit_code});
+    send_response($client, $request->{method}, $status, { 'Content-Type' => 'application/json' }, $body);
+    return $status;
 }
 
 sub serve_dir_listing {
@@ -572,12 +482,12 @@ sub serve_filesystem_fallback {
     $fallback = $abs_route_dir if !@{$segs};
     if (-d $fallback) {
         my ($kind, $candidate) = find_directory_index($fallback);
-        return execute_plain_file($client, $request, $candidate, $timeout_seconds, $listen_addr) if defined($kind) && is_executable($candidate);
+        return execute_handler($client, $request, $candidate, {}, $timeout_seconds, $listen_addr) if defined($kind) && is_executable($candidate);
         return serve_static($client, $request->{method}, $candidate) if defined($kind);
         return serve_dir_listing($client, $request->{method}, $fallback, $request->{path});
     }
     if (-f $fallback) {
-        return execute_plain_file($client, $request, $fallback, $timeout_seconds, $listen_addr) if is_executable($fallback);
+        return execute_handler($client, $request, $fallback, {}, $timeout_seconds, $listen_addr) if is_executable($fallback);
         return serve_static($client, $request->{method}, $fallback);
     }
     return write_json($client, $request->{method}, 404, { error => 'not_found', path => $request->{path} });
@@ -639,25 +549,7 @@ sub handle_handler {
     if (!is_executable($handler_path)) {
         return serve_static($client, $request->{method}, $handler_path);
     }
-    my $env = build_env($request, $params, $listen_addr);
-    my $result = run_handler($handler_path, $request->{body}, $env, $timeout_seconds);
-    if ($result->{timed_out}) {
-        return write_json($client, $request->{method}, 504, { error => 'handler_timeout', timeout_seconds => $timeout_seconds });
-    }
-    if (!$result->{ok} && $result->{exit_code} == 127) {
-        return write_json($client, $request->{method}, 502, { error => 'exec_failed', message => $result->{reason} });
-    }
-    if ($result->{stderr} ne '') {
-        my $stderr = $result->{stderr};
-        $stderr =~ s/[\r\n]+$//;
-        print STDERR "  [handler stderr] $stderr\n";
-        STDERR->flush();
-    }
-    my $raw = $result->{stdout};
-    if ($raw eq '' && $result->{exit_code} != 0 && $result->{stderr} ne '') {
-        $raw = $result->{stderr};
-    }
-    return write_cgi_response($client, $request->{method}, $raw, $result->{exit_code});
+    return execute_handler($client, $request, $handler_path, $params, $timeout_seconds, $listen_addr);
 }
 
 sub parse_listen_addr {

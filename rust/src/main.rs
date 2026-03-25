@@ -4,7 +4,7 @@ use axum::{
     http::{
         header::{CONTENT_TYPE, HOST},
         request::Parts,
-        HeaderName, HeaderValue, Method, Response, StatusCode,
+        HeaderValue, Method, Response, StatusCode,
     },
     routing::any,
     Router,
@@ -261,7 +261,7 @@ async fn handle_handler(
         raw = output.stderr;
     }
 
-    cgi_response(raw, exit_code, parts.method == Method::HEAD)
+    handler_response(raw, exit_code, parts.method == Method::HEAD)
 }
 
 async fn handle_plain_file(
@@ -336,21 +336,13 @@ async fn handle_plain_file(
         );
     }
 
-    let body_bytes = output.stdout;
-    let len = body_bytes.len();
-    let mut response = Response::new(if parts.method == Method::HEAD {
-        Body::empty()
-    } else {
-        Body::from(body_bytes)
-    });
-    *response.status_mut() = exit_to_status(output.status.code().unwrap_or(1));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
-        response.headers_mut().insert("content-length", value);
+    let exit_code = output.status.code().unwrap_or(1);
+    let mut raw = output.stdout;
+    if raw.is_empty() && exit_code != 0 && !output.stderr.is_empty() {
+        raw = output.stderr;
     }
-    response
+
+    handler_response(raw, exit_code, parts.method == Method::HEAD)
 }
 
 async fn serve_static(path: &Path, suppress_body: bool) -> Response<Body> {
@@ -381,125 +373,17 @@ async fn serve_static(path: &Path, suppress_body: bool) -> Response<Body> {
     response
 }
 
-fn cgi_response(raw: Vec<u8>, exit_code: i32, suppress_body: bool) -> Response<Body> {
-    let mut status = exit_to_status(exit_code);
-    let mut content_type = "application/json".to_string();
-    let mut headers = Vec::new();
-    let mut body = raw;
-
-    if !body.is_empty() && looks_like_header(&body) {
-        if let Some(parsed) = parse_cgi_headers(&body, status) {
-            status = parsed.status;
-            content_type = parsed.content_type;
-            headers = parsed.headers;
-            body = body[parsed.body_offset..].to_vec();
-        }
-    }
-
+fn handler_response(body: Vec<u8>, exit_code: i32, suppress_body: bool) -> Response<Body> {
     let mut response = Response::new(if suppress_body {
         Body::empty()
     } else {
         Body::from(body)
     });
-    *response.status_mut() = status;
-    for (name, value) in headers {
-        response.headers_mut().insert(name, value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&content_type) {
-        response.headers_mut().insert(CONTENT_TYPE, value);
-    }
+    *response.status_mut() = exit_to_status(exit_code);
     response
-}
-
-struct ParsedCgiHeaders {
-    status: StatusCode,
-    content_type: String,
-    headers: Vec<(HeaderName, HeaderValue)>,
-    body_offset: usize,
-}
-
-fn parse_cgi_headers(raw: &[u8], default_status: StatusCode) -> Option<ParsedCgiHeaders> {
-    let mut cursor = 0usize;
-    let mut status = default_status;
-    let mut content_type = "application/json".to_string();
-    let mut headers = Vec::new();
-    let mut saw_blank = false;
-
-    while cursor < raw.len() {
-        let line_end = raw[cursor..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|offset| cursor + offset)
-            .unwrap_or(raw.len());
-
-        let mut line = &raw[cursor..line_end];
-        if line.ends_with(b"\r") {
-            line = &line[..line.len().saturating_sub(1)];
-        }
-
-        let next = if line_end < raw.len() { line_end + 1 } else { raw.len() };
-
-        if line.is_empty() {
-            saw_blank = true;
-            cursor = next;
-            break;
-        }
-
-        let line = String::from_utf8_lossy(line);
-        let (key, value) = parse_header_line(&line)?;
-
-        if key.eq_ignore_ascii_case("status") {
-            if let Some(code) = value.split_whitespace().next() {
-                if let Ok(parsed) = code.parse::<u16>() {
-                    if let Ok(parsed_status) = StatusCode::from_u16(parsed) {
-                        status = parsed_status;
-                    }
-                }
-            }
-        } else if key.eq_ignore_ascii_case("content-type") {
-            content_type = value;
-        } else {
-            let name = HeaderName::from_bytes(key.as_bytes()).ok()?;
-            let header_value = HeaderValue::from_str(&value).ok()?;
-            headers.push((name, header_value));
-        }
-
-        cursor = next;
-    }
-
-    if !saw_blank {
-        return None;
-    }
-
-    Some(ParsedCgiHeaders {
-        status,
-        content_type,
-        headers,
-        body_offset: cursor,
-    })
-}
-
-fn parse_header_line(line: &str) -> Option<(String, String)> {
-    let (key, value) = line.split_once(':')?;
-    if key.is_empty() {
-        return None;
-    }
-    if key.chars().any(|ch| ch <= ' ' || ch == '\u{7f}') {
-        return None;
-    }
-    Some((key.to_string(), value.trim().to_string()))
-}
-
-fn looks_like_header(raw: &[u8]) -> bool {
-    for (idx, byte) in raw.iter().enumerate() {
-        match *byte {
-            b':' if idx > 0 => return true,
-            b'\n' | b'\r' => return false,
-            b' ' | b'\t' => return false,
-            _ => {}
-        }
-    }
-    false
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
 }
 
 fn exit_to_status(code: i32) -> StatusCode {

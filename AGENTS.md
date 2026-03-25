@@ -58,6 +58,9 @@ python3 -m py_compile tools/fsrouter-watch.py
 - Prefer editing source files, not generated artifacts.
 - Do not hand-edit compiled `.class` files or built binaries such as
   `go/fsrouter`; change the corresponding source instead.
+- The filesystem-to-URL mapping is the core design constraint. Do not introduce
+  routing mechanisms that bypass or supplement the directory tree (config files,
+  annotations, code-level route registration, etc.).
 - Keep changes narrowly scoped to the behavior being modified.
 - Preserve the repository's existing plain, dependency-light style.
 - When adding cross-cutting features, think about all implementations, not just

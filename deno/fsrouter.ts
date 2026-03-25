@@ -5,13 +5,6 @@ type MatchResult = {
   params: Record<string, string> | null;
 };
 
-type ParsedCgi = {
-  status: number;
-  contentType: string;
-  headers: Array<[string, string]>;
-  body: Uint8Array;
-};
-
 class Node {
   literal = new Map<string, Node>();
   param: Node | null = null;
@@ -265,78 +258,6 @@ function jsonResponse(status: number, payload: unknown, method: string, headers:
   return new Response(method === "HEAD" ? null : bodyText, { status, headers: initHeaders });
 }
 
-function looksLikeHeader(raw: Uint8Array): boolean {
-  for (const byte of raw) {
-    if (byte === 58) {
-      return true;
-    }
-    if (byte === 10 || byte === 13 || byte === 32 || byte === 9) {
-      return false;
-    }
-  }
-  return false;
-}
-
-function parseCgiHeaders(raw: Uint8Array, defaultStatus: number): ParsedCgi | null {
-  let status = defaultStatus;
-  let contentType = "application/json";
-  const headers: Array<[string, string]> = [];
-  let pos = 0;
-  let sawBlank = false;
-
-  while (pos < raw.length) {
-    let newline = pos;
-    while (newline < raw.length && raw[newline] !== 10) {
-      newline += 1;
-    }
-    let line = raw.slice(pos, newline);
-    const nextPos = newline < raw.length ? newline + 1 : raw.length;
-    if (line.length > 0 && line[line.length - 1] === 13) {
-      line = line.slice(0, line.length - 1);
-    }
-    if (line.length === 0) {
-      sawBlank = true;
-      pos = nextPos;
-      break;
-    }
-    const text = textDecoder.decode(line);
-    const idx = text.indexOf(":");
-    if (idx <= 0) {
-      return null;
-    }
-    const key = text.slice(0, idx);
-    for (const ch of key) {
-      const code = ch.charCodeAt(0);
-      if (code <= 32 || code === 127) {
-        return null;
-      }
-    }
-    const value = text.slice(idx + 1).trim();
-    if (key.toLowerCase() === "status") {
-      const code = Number.parseInt(value.split(/\s+/)[0] ?? "", 10);
-      if (Number.isFinite(code)) {
-        status = code;
-      }
-    } else if (key.toLowerCase() === "content-type") {
-      contentType = value;
-    } else {
-      headers.push([key, value]);
-    }
-    pos = nextPos;
-  }
-
-  if (!sawBlank) {
-    return null;
-  }
-
-  return {
-    status,
-    contentType,
-    headers,
-    body: raw.slice(pos),
-  };
-}
-
 async function executeHandler(handlerPath: string, request: Request, params: Record<string, string>, timeoutSeconds: number, remoteAddr: Deno.NetAddr | null, listenAddr: string): Promise<Response> {
   const requestBody = new Uint8Array(await request.arrayBuffer());
   const env = buildEnv(request, params, remoteAddr, listenAddr);
@@ -397,97 +318,12 @@ async function executeHandler(handlerPath: string, request: Request, params: Rec
     console.error(`  [handler stderr] ${textDecoder.decode(stderr).replace(/\n$/, "")}`);
   }
 
-  let raw = stdout;
-  if (raw.length === 0 && status.code !== 0 && stderr.length > 0) {
-    raw = stderr;
-  }
-
-  let responseStatus = exitToStatus(status.code);
-  let contentType = "application/json";
+  const body = (stdout.length === 0 && status.code !== 0 && stderr.length > 0) ? stderr : stdout;
+  const responseStatus = exitToStatus(status.code);
   const headers = new Headers();
-  let body = raw;
-
-  if (raw.length > 0 && looksLikeHeader(raw)) {
-    const parsed = parseCgiHeaders(raw, responseStatus);
-    if (parsed) {
-      responseStatus = parsed.status;
-      contentType = parsed.contentType;
-      body = parsed.body;
-      for (const [key, value] of parsed.headers) {
-        headers.append(key, value);
-      }
-    }
-  }
-
-  headers.set("content-type", contentType);
+  headers.set("content-type", "application/json");
   headers.set("content-length", String(body.length));
   return new Response(request.method === "HEAD" ? null : responseBody(body), { status: responseStatus, headers });
-}
-
-async function executePlainFile(handlerPath: string, request: Request, timeoutSeconds: number, remoteAddr: Deno.NetAddr | null, listenAddr: string): Promise<Response> {
-  const requestBody = new Uint8Array(await request.arrayBuffer());
-  const env = buildEnv(request, {}, remoteAddr, listenAddr);
-  const cwd = handlerPath.includes("/") ? handlerPath.slice(0, handlerPath.lastIndexOf("/")) : ".";
-
-  let child: Deno.ChildProcess;
-  try {
-    child = new Deno.Command(handlerPath, {
-      cwd,
-      env,
-      stdin: "piped",
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
-  } catch (error) {
-    return jsonResponse(502, { error: "exec_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
-  }
-
-  const stdinPromise = (async () => {
-    if (child.stdin) {
-      const writer = child.stdin.getWriter();
-      await writer.write(requestBody);
-      await writer.close();
-    }
-  })();
-
-  const stdoutPromise = child.stdout ? new Response(child.stdout).arrayBuffer().then((buf) => new Uint8Array(buf)) : Promise.resolve(new Uint8Array());
-  const stderrPromise = child.stderr ? new Response(child.stderr).arrayBuffer().then((buf) => new Uint8Array(buf)) : Promise.resolve(new Uint8Array());
-
-  let timedOut = false;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    const id = setTimeout(() => {
-      timedOut = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-      }
-      clearTimeout(id);
-      reject(new Error("timeout"));
-    }, timeoutSeconds * 1000);
-  });
-
-  let status: Deno.CommandStatus;
-  let stdout: Uint8Array;
-  let stderr: Uint8Array;
-  try {
-    await stdinPromise;
-    status = await Promise.race([child.status, timeoutPromise]);
-    [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-  } catch (error) {
-    if (timedOut) {
-      return jsonResponse(504, { error: "handler_timeout", timeout_seconds: timeoutSeconds }, request.method);
-    }
-    return jsonResponse(500, { error: "exec_failed", message: error instanceof Error ? error.message : String(error) }, request.method);
-  }
-
-  if (stderr.length > 0) {
-    console.error(`  [handler stderr] ${textDecoder.decode(stderr).replace(/\n$/, "")}`);
-  }
-
-  const headers = new Headers();
-  headers.set("content-type", "text/plain");
-  headers.set("content-length", String(stdout.length));
-  return new Response(request.method === "HEAD" ? null : responseBody(stdout), { status: exitToStatus(status.code), headers });
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -576,7 +412,7 @@ async function serveFallbackFile(
 ): Promise<Response> {
   const fileInfo = info ?? await Deno.stat(path);
   if (fileInfo.mode != null && (fileInfo.mode & 0o111) !== 0) {
-    return executePlainFile(path, request, timeoutSeconds, remoteAddr, listenAddr);
+    return executeHandler(path, request, {}, timeoutSeconds, remoteAddr, listenAddr);
   }
   return serveStatic(path, request);
 }

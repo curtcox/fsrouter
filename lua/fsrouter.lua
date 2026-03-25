@@ -357,88 +357,6 @@ local function exit_to_status(code)
   return 500
 end
 
-local function looks_like_header(raw)
-  for i = 1, #raw do
-    local byte = raw:byte(i)
-    if byte == string.byte(":") and i > 1 then
-      return true
-    end
-    if byte == string.byte("\n") or byte == string.byte("\r") or byte == string.byte(" ") or byte == string.byte("\t") then
-      return false
-    end
-  end
-  return false
-end
-
-local function parse_header_line(line)
-  local key, value = line:match("^([^:]+):%s*(.*)$")
-  if not key or key == "" then
-    return nil
-  end
-  for i = 1, #key do
-    local b = key:byte(i)
-    if b <= 32 or b == 127 then
-      return nil
-    end
-  end
-  return key, value
-end
-
-local function parse_cgi_headers(raw, default_status)
-  local status = default_status
-  local content_type = "application/json"
-  local headers = {}
-  local pos = 1
-  local saw_blank = false
-
-  while pos <= #raw do
-    local newline = raw:find("\n", pos, true)
-    local line
-    local next_pos
-    if newline then
-      line = raw:sub(pos, newline - 1)
-      next_pos = newline + 1
-    else
-      line = raw:sub(pos)
-      next_pos = #raw + 1
-    end
-    if line:sub(-1) == "\r" then
-      line = line:sub(1, -2)
-    end
-    if line == "" then
-      saw_blank = true
-      pos = next_pos
-      break
-    end
-    local key, value = parse_header_line(line)
-    if not key then
-      return nil
-    end
-    if string.lower(key) == "status" then
-      local first = value:match("^(%d+)")
-      if first then
-        status = tonumber(first) or status
-      end
-    elseif string.lower(key) == "content-type" then
-      content_type = value
-    else
-      headers[#headers + 1] = { key = key, value = value }
-    end
-    pos = next_pos
-  end
-
-  if not saw_blank then
-    return nil
-  end
-
-  return {
-    status = status,
-    content_type = content_type,
-    headers = headers,
-    body = raw:sub(pos),
-  }
-end
-
 local function content_type_for(path)
   local ext = split_ext(path)
   return MIME_TYPES[ext] or "application/octet-stream"
@@ -548,27 +466,6 @@ local function write_json(client, method, status, payload, extra_headers)
   return status
 end
 
-local function write_cgi_response(client, method, raw, exit_code)
-  local status = exit_to_status(exit_code)
-  local content_type = "application/json"
-  local extra_headers = {}
-  local body = raw
-  if #raw > 0 and looks_like_header(raw) then
-    local parsed = parse_cgi_headers(raw, status)
-    if parsed then
-      status = parsed.status
-      content_type = parsed.content_type
-      for _, item in ipairs(parsed.headers) do
-        extra_headers[item.key] = item.value
-      end
-      body = parsed.body
-    end
-  end
-  extra_headers["Content-Type"] = content_type
-  send_response(client, method, status, extra_headers, body)
-  return status
-end
-
 local function serve_static(client, method, handler_path)
   local ok, data = pcall(read_file, handler_path)
   if not ok then
@@ -576,23 +473,6 @@ local function serve_static(client, method, handler_path)
   end
   send_response(client, method, 200, { ["Content-Type"] = content_type_for(handler_path) }, data)
   return 200
-end
-
-local function execute_plain_file(client, request, handler_path, timeout_seconds, listen_addr)
-  local env = build_env(request, {}, listen_addr)
-  local result = run_handler(handler_path, request.body, env, timeout_seconds)
-  if result.timed_out then
-    return write_json(client, request.method, 504, { error = "handler_timeout", timeout_seconds = timeout_seconds })
-  end
-  if not result.ok and result.exit_code == 0 then
-    return write_json(client, request.method, 502, { error = "exec_failed", message = tostring(result.reason) })
-  end
-  if result.stderr ~= "" then
-    io.stderr:write("  [handler stderr] " .. result.stderr:gsub("[\r\n]+$", "") .. "\n")
-    io.stderr:flush()
-  end
-  send_response(client, request.method, exit_to_status(result.exit_code), { ["Content-Type"] = "text/plain" }, result.stdout)
-  return exit_to_status(result.exit_code)
 end
 
 local function is_dir(path)
@@ -671,18 +551,12 @@ local function serve_filesystem_fallback(client, request, segs, route_dir, timeo
   if is_dir(fallback) then
     local kind, candidate = find_directory_index(fallback)
     if kind then
-      if is_executable(candidate) then
-        return execute_plain_file(client, request, candidate, timeout_seconds, listen_addr)
-      end
-      return serve_static(client, request.method, candidate)
+      return handle_handler(client, request, candidate, {}, timeout_seconds, listen_addr)
     end
     return serve_dir_listing(client, request.method, fallback, request.path)
   end
   if is_file(fallback) then
-    if is_executable(fallback) then
-      return execute_plain_file(client, request, fallback, timeout_seconds, listen_addr)
-    end
-    return serve_static(client, request.method, fallback)
+    return handle_handler(client, request, fallback, {}, timeout_seconds, listen_addr)
   end
   return write_json(client, request.method, 404, { error = "not_found", path = request.path })
 end
@@ -738,7 +612,7 @@ handle_handler = function(client, request, handler_path, params, timeout_seconds
   if not is_executable(handler_path) then
     return serve_static(client, request.method, handler_path)
   end
-  local env = build_env(request, params, listen_addr)
+  local env = build_env(request, params or {}, listen_addr)
   local result = run_handler(handler_path, request.body, env, timeout_seconds)
   if result.timed_out then
     return write_json(client, request.method, 504, { error = "handler_timeout", timeout_seconds = timeout_seconds })
@@ -750,11 +624,13 @@ handle_handler = function(client, request, handler_path, params, timeout_seconds
     io.stderr:write("  [handler stderr] " .. result.stderr:gsub("[\r\n]+$", "") .. "\n")
     io.stderr:flush()
   end
-  local raw = result.stdout
-  if raw == "" and result.exit_code ~= 0 and result.stderr ~= "" then
-    raw = result.stderr
+  local body = result.stdout
+  if body == "" and result.exit_code ~= 0 and result.stderr ~= "" then
+    body = result.stderr
   end
-  return write_cgi_response(client, request.method, raw, result.exit_code)
+  local status = exit_to_status(result.exit_code)
+  send_response(client, request.method, status, { ["Content-Type"] = "application/json" }, body)
+  return status
 end
 
 local function parse_listen_addr(addr)

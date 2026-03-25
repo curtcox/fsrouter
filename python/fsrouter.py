@@ -117,41 +117,7 @@ class Handler(BaseHTTPRequestHandler):
         if not is_executable(st):
             return self.serve_static(handler_path)
 
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        request_body = self.rfile.read(length) if length > 0 else b""
-        env = build_env(self, params)
-
-        try:
-            proc = subprocess.Popen(
-                [str(handler_path)],
-                cwd=str(handler_path.parent),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
-        except OSError as err:
-            self.write_json(502, {"error": "exec_failed", "message": str(err)})
-            return 502
-
-        try:
-            stdout, stderr = proc.communicate(request_body, timeout=self.server.command_timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            self.write_json(504, {"error": "handler_timeout", "timeout_seconds": self.server.command_timeout})
-            return 504
-
-        if stderr:
-            sys.stderr.write(f"  [handler stderr] {stderr.decode('utf-8', errors='replace').rstrip()}\n")
-            sys.stderr.flush()
-
-        exit_code = proc.returncode or 0
-        raw = stdout
-        if not raw and exit_code != 0 and stderr:
-            raw = stderr
-
-        return self.write_cgi_response(raw, exit_code)
+        return self.execute_handler(handler_path, params)
 
     def serve_filesystem_fallback(self, segs: list[str], request_path: str) -> int:
         fallback = self.server.route_dir_abs.joinpath(*segs) if segs else self.server.route_dir_abs
@@ -190,13 +156,13 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json(500, {"error": "handler_stat_failed", "message": str(err)})
             return 500
         if is_executable(st):
-            return self.execute_plain_file(path)
+            return self.execute_handler(path, {})
         return self.serve_static(path)
 
-    def execute_plain_file(self, path: Path) -> int:
+    def execute_handler(self, path: Path, params: dict[str, str]) -> int:
         length = int(self.headers.get("Content-Length", "0") or "0")
         request_body = self.rfile.read(length) if length > 0 else b""
-        env = build_env(self, {})
+        env = build_env(self, params)
 
         try:
             proc = subprocess.Popen(
@@ -223,13 +189,18 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f"  [handler stderr] {stderr.decode('utf-8', errors='replace').rstrip()}\n")
             sys.stderr.flush()
 
-        status = exit_to_status(proc.returncode or 0)
+        exit_code = proc.returncode or 0
+        body = stdout
+        if not body and exit_code != 0 and stderr:
+            body = stderr
+
+        status = exit_to_status(exit_code)
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(stdout)))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(stdout)
+            self.wfile.write(body)
         return status
 
     def serve_dir_listing(self, dir_path: Path, request_path: str) -> int:
@@ -273,27 +244,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
         return 200
-
-    def write_cgi_response(self, raw: bytes, exit_code: int) -> int:
-        status = exit_to_status(exit_code)
-        content_type = "application/json"
-        headers: list[tuple[str, str]] = []
-        body = raw
-
-        if raw and looks_like_header(raw):
-            parsed = parse_cgi_headers(raw, status)
-            if parsed is not None:
-                status, content_type, headers, body = parsed
-
-        self.send_response(status)
-        for key, value in headers:
-            self.send_header(key, value)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-        return status
 
     def write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode()
@@ -431,76 +381,6 @@ def split_host_port(value: str) -> tuple[str, str]:
 
 def env_key(value: str) -> str:
     return value.upper().replace("-", "_")
-
-
-def parse_cgi_headers(raw: bytes, default_status: int) -> Optional[tuple[int, str, list[tuple[str, str]], bytes]]:
-    status = default_status
-    content_type = "application/json"
-    headers: list[tuple[str, str]] = []
-    pos = 0
-    saw_blank = False
-
-    while pos < len(raw):
-        newline = raw.find(b"\n", pos)
-        if newline == -1:
-            line = raw[pos:]
-            next_pos = len(raw)
-        else:
-            line = raw[pos:newline]
-            next_pos = newline + 1
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        if line == b"":
-            saw_blank = True
-            pos = next_pos
-            break
-        try:
-            text = line.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-        parsed = parse_header_line(text)
-        if parsed is None:
-            return None
-        key, value = parsed
-        if key.lower() == "status":
-            first = value.split()
-            if first:
-                try:
-                    status = int(first[0])
-                except ValueError:
-                    pass
-        elif key.lower() == "content-type":
-            content_type = value
-        else:
-            headers.append((key, value))
-        pos = next_pos
-
-    if not saw_blank:
-        return None
-    return status, content_type, headers, raw[pos:]
-
-
-def parse_header_line(line: str) -> Optional[tuple[str, str]]:
-    if ":" not in line:
-        return None
-    key, value = line.split(":", 1)
-    if not key:
-        return None
-    for ch in key:
-        if ord(ch) <= 32 or ord(ch) == 127:
-            return None
-    return key, value.strip()
-
-
-def looks_like_header(raw: bytes) -> bool:
-    for idx, byte in enumerate(raw):
-        if byte == ord(":") and idx > 0:
-            return True
-        if byte in (ord("\n"), ord("\r")):
-            return False
-        if byte in (ord(" "), ord("\t")):
-            return False
-    return False
 
 
 def exit_to_status(code: int) -> int:

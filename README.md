@@ -2,6 +2,13 @@
 
 `fsrouter` is a filesystem-driven HTTP server: your directory tree defines your API.
 
+The core idea is a 1-to-1 correspondence between files and URLs. You create a
+file at a path, and it becomes reachable at the matching URL — no routing
+configuration, no DSL, no annotations. The filesystem *is* the router. If you
+need behavior beyond what the directory tree provides, you can add executable
+handler scripts, but the directory structure remains the single source of truth
+for what URLs exist.
+
 This repository contains a protocol/specification plus multiple implementations of the same server.
 
 ## Repository layout
@@ -31,11 +38,16 @@ The `examples/` tree contains runnable sample apps built on top of fsrouter.
 
 Each implementation scans a route directory at startup and turns it into an HTTP routing table.
 
+At its core:
+
 - Directories become URL path segments.
 - Files named `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, and `OPTIONS` become handlers.
-- Directories beginning with `:` are path parameters.
-- Executable handler files run as subprocesses.
-- Non-executable handler files are served as static content.
+
+Additionally:
+
+- Directories beginning with `:` capture path parameters.
+- Executable handler files run as subprocesses; non-executable files are served as static content.
+- Any other file in the tree is served at its matching URL path.
 
 Example:
 
@@ -199,15 +211,10 @@ cd python && python3 fsrouter.py
 
 Located in `examples/ai/`.
 
-The app now auto-generates a validation command per request, risk-scores it,
-requires the preflight check to fail before any filesystem edits begin, and
-adds a separate planning-stage risk review that pauses for user input when the
-strategy looks too risky.
-
-This example is intended to keep URL-to-filesystem mapping direct: serve
-`examples/ai` itself as the route root, let ordinary files under that tree be
-reachable at matching URL paths, and reserve custom handlers for derived views
-such as workflow state, stored snapshots, and diffs.
+This example demonstrates the intended usage pattern: the route directory
+(`examples/ai`) is served directly, so ordinary files are reachable at their
+corresponding URL paths. Custom executable handlers are added only for derived
+views (workflow state, snapshots, diffs) that don't correspond to static files.
 
 - Run:
 

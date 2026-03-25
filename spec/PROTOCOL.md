@@ -1,6 +1,6 @@
 # fsrouter Protocol Specification
 
-**Version:** 1.1.0
+**Version:** 2.0.0
 
 This document defines the behavior of a conforming fsrouter implementation. It is
 the authoritative reference — when an implementation disagrees with this document,
@@ -18,6 +18,12 @@ is to:
 1. Walk a directory tree at startup to discover handlers.
 2. Match incoming HTTP requests to handlers by path and method.
 3. Execute handlers and return their output to the client.
+
+The fundamental design constraint is a direct correspondence between filesystem
+paths and URL paths. Every URL the server can handle traces back to a file or
+directory at the matching location in the route tree. There is no separate
+routing table, configuration file, or code-level route registration — the
+directory layout is the only routing mechanism.
 
 The rest of this document specifies exactly how each of those steps works.
 
@@ -71,6 +77,11 @@ the registered route is:
     Method:   GET
     Pattern:  /api/v1/users/:id
 
+This is the one place where filesystem paths and URL paths intentionally differ:
+the method filename is consumed as routing metadata rather than appearing in the
+URL. Every other file in the route directory is reachable at exactly its
+filesystem path relative to `ROUTE_DIR`.
+
 ### 3.3. Startup logging
 
 After scanning, the server MUST log every registered route to stderr in the
@@ -123,10 +134,17 @@ handler for the request's HTTP method.
 - If yes, dispatch to that handler.
 - If no, but handlers exist for *other* methods at that node, return
   **405 Method Not Allowed** with an `Allow` header listing the available
-  methods.
+  methods. Note: the presence of any method file at a node claims that path
+  for handler routing — filesystem fallback (§4.4) is not consulted, even
+  for methods that have no handler at that node.
 - If path matching itself failed (no node matched), proceed to **§4.4 Filesystem Fallback**.
 
 ### 4.4. Filesystem Fallback
+
+This mechanism ensures that any regular file in the route directory is reachable
+at its corresponding URL path, preserving the 1-to-1 mapping between filesystem
+paths and URLs even for files that are not method handlers. Handler routes
+(method files) take priority when both exist for the same path.
 
 When no handler route matches the request path (step 3 of §4.2 fails at any
 level, or the matched node has no handler files at all), the server attempts to
@@ -140,14 +158,10 @@ serve the path directly from the filesystem before returning 404.
      - Status: `200 OK`
      - `Content-Type`: detected from the file extension (same logic as §5.2).
      - Body: the raw file contents.
-   - If the file is executable, execute it:
-     - The subprocess working directory is the file's parent directory.
-     - Invocation, environment, stdin delivery, and timeout handling follow the
-       executable handler rules in §5.3.
-     - The response status defaults from the exit code using the same mapping as
-       §5.3 (`0 -> 200`, `1 -> 400`, all others -> `500`).
-     - `Content-Type: text/plain`
-     - Body: the subprocess's stdout exactly, without CGI header parsing.
+   - If the file is executable, execute it using the same contract as
+     executable handlers (§5.3). The subprocess working directory, invocation,
+     environment, stdin delivery, timeout handling, stdout interpretation, and
+     Content-Type default all follow §5.3 exactly.
 3. **Directory** — if the candidate path is a directory:
    1. If `index.html` exists and is a regular file, serve that file exactly as
       in step 2.
@@ -161,7 +175,7 @@ serve the path directly from the filesystem before returning 404.
       - `Content-Type: text/html; charset=utf-8`
       - Body: a simple HTML directory listing with hyperlinks to each entry.
         Subdirectories are shown with a trailing `/`.
-4. **Not found** — otherwise return **404 Not Found** (§8.1).
+4. **Not found** — otherwise return **404 Not Found** (§7.1).
 
 The filesystem fallback is intentionally a last resort. Handler routes always
 take priority. The 405 response is returned before this fallback is attempted
@@ -227,8 +241,13 @@ subprocess — it should pipe the body as it arrives when practical.
 
 #### 5.3.4. Standard output
 
-The subprocess writes its response to stdout. The output is interpreted
-according to the CGI-style response protocol defined in Section 6.
+The subprocess writes its response body to stdout. The entire stdout content
+is used as the response body with no interpretation or transformation by the
+server.
+
+The default `Content-Type` for executable handler output is
+`application/json`. The rationale: fsrouter is designed for API servers where
+JSON is the overwhelmingly common response format.
 
 #### 5.3.5. Standard error
 
@@ -241,15 +260,11 @@ handlers to write structured error output to stderr as a fallback.
 
 #### 5.3.6. Exit codes
 
-| Exit code | Default HTTP status |
-|-----------|---------------------|
+| Exit code | HTTP status |
+|-----------|-------------|
 | 0         | 200 OK              |
 | 1         | 400 Bad Request     |
 | 2+        | 500 Internal Server Error |
-
-These defaults apply only when the handler does not emit a `Status` header
-(see Section 6). If a `Status` header is present, it overrides the exit code
-mapping entirely.
 
 #### 5.3.7. Timeout
 
@@ -270,66 +285,9 @@ denied after initial check, binary format error), the server returns
 
 ---
 
-## 6. Response Protocol
+## 6. Environment Variables
 
-The response protocol is modeled on CGI/1.1 (RFC 3875) but simplified. There
-are two modes: **raw mode** (the default) and **header mode**.
-
-### 6.1. Detection
-
-The server inspects the first line of stdout. If it matches the pattern of an
-HTTP header (`Token: Value`, where Token contains no whitespace or control
-characters), the server attempts to parse CGI-style headers. Otherwise, the
-entire stdout is treated as the response body (raw mode).
-
-### 6.2. Raw mode
-
-The entire stdout content is the response body. The server applies:
-
-- `Content-Type: application/json` (default).
-- HTTP status from exit code mapping (Section 5.3.6).
-
-### 6.3. Header mode
-
-The server reads lines from the start of stdout until it encounters a blank
-line (a line containing only `\n` or `\r\n`). Each line before the blank line
-is parsed as a header. Everything after the blank line is the response body.
-
-If at any point a line does not look like a valid header, the server abandons
-header parsing and falls back to raw mode (treating the entire stdout as body).
-
-#### 6.3.1. Recognized headers
-
-| Header | Effect |
-|--------|--------|
-| `Status: <code>` | Sets the HTTP response status code. The value is the first whitespace-delimited token, parsed as an integer. Any text after the code is ignored (e.g., `Status: 201 Created` sets status 201). |
-| `Content-Type: <type>` | Sets the response Content-Type, overriding the default. |
-| Any other `Key: Value` | Set as an HTTP response header on the outgoing response. |
-
-#### 6.3.2. Header validity
-
-A header line is valid if:
-
-- It contains a colon (`:`).
-- The portion before the colon (the key) is non-empty.
-- The key contains no whitespace, control characters, or characters with
-  code points below 33 or equal to 127.
-
-### 6.4. Content-Type default
-
-If no `Content-Type` header is emitted by the handler (either in header mode
-or because the handler uses raw mode), the server defaults to
-`application/json`.
-
-The rationale: fsrouter is designed for API servers where JSON is the
-overwhelmingly common response format. Handlers that return other formats
-must declare them explicitly.
-
----
-
-## 7. Environment Variables
-
-### 7.1. Server configuration
+### 6.1. Server configuration
 
 These variables configure the server itself. They are read once at startup.
 
@@ -339,7 +297,7 @@ These variables configure the server itself. They are read once at startup.
 | `LISTEN_ADDR` | `:8080` | Bind address in `host:port` or `:port` form |
 | `COMMAND_TIMEOUT` | `30` | Handler timeout in seconds |
 
-#### 7.1.1. Listen address forms
+#### 6.1.1. Listen address forms
 
 Implementations MUST accept the following `LISTEN_ADDR` forms:
 
@@ -362,12 +320,12 @@ local machine, subject to the operating system, firewall, and network policy.
 A server started with `127.0.0.1:8080` or `[::1]:8080` is intended to accept
 requests only from the local machine.
 
-### 7.2. Request variables
+### 6.2. Request variables
 
 These variables are set for every handler subprocess invocation. They do not
 exist in the server's own environment — they are constructed per request.
 
-#### 7.2.1. Standard request metadata
+#### 6.2.1. Standard request metadata
 
 | Variable | Description | Example |
 |---|---|---|
@@ -384,7 +342,7 @@ exist in the server's own environment — they are constructed per request.
 `CONTENT_TYPE` and `CONTENT_LENGTH` are set to the empty string if the
 corresponding request headers are absent.
 
-#### 7.2.2. Path parameters
+#### 6.2.2. Path parameters
 
 For each parameter segment matched during routing, the server sets:
 
@@ -404,7 +362,7 @@ converted to underscores.
 Path parameter values are the raw URL-decoded matched segment. No further
 transformation is applied.
 
-#### 7.2.3. Query parameters
+#### 6.2.3. Query parameters
 
 For each unique query parameter key, the server sets:
 
@@ -422,7 +380,7 @@ only the first value is used. Handlers that need all values should parse
 | `?per-page=20` | `QUERY_PER_PAGE` | `20` |
 | `?x=1&x=2` | `QUERY_X` | `1` |
 
-#### 7.2.4. Request headers
+#### 6.2.4. Request headers
 
 All HTTP request headers are forwarded as environment variables:
 
@@ -441,10 +399,10 @@ by underscores.
 `HTTP_CONTENT_TYPE` / `HTTP_CONTENT_LENGTH`. They are available only as
 `CONTENT_TYPE` and `CONTENT_LENGTH` (per CGI convention).
 
-#### 7.2.5. Inherited environment
+#### 6.2.5. Inherited environment
 
 The subprocess inherits the server's own environment. Request-specific
-variables (Sections 7.2.1–7.2.4) are appended. If a request variable collides
+variables (Sections 6.2.1–6.2.4) are appended. If a request variable collides
 with a server environment variable, the request variable wins (it appears
 later in the environment list, and most implementations use last-write-wins
 semantics).
@@ -455,18 +413,18 @@ needing to know about them.
 
 ---
 
-## 8. Error Responses
+## 7. Error Responses
 
 The server produces its own error responses for routing and execution failures.
 These are always JSON.
 
-### 8.1. 404 Not Found
+### 7.1. 404 Not Found
 
 ```json
 {"error": "not_found", "path": "/no/such/route"}
 ```
 
-### 8.2. 405 Method Not Allowed
+### 7.2. 405 Method Not Allowed
 
 ```json
 {"error": "method_not_allowed", "allow": ["GET", "POST"]}
@@ -474,7 +432,7 @@ These are always JSON.
 
 The response includes an `Allow` header per RFC 9110.
 
-### 8.3. 502 Bad Gateway
+### 7.3. 502 Bad Gateway
 
 ```json
 {"error": "exec_failed", "message": "<OS error detail>"}
@@ -482,7 +440,7 @@ The response includes an `Allow` header per RFC 9110.
 
 Returned when a handler file cannot be executed.
 
-### 8.4. 504 Gateway Timeout
+### 7.4. 504 Gateway Timeout
 
 ```json
 {"error": "handler_timeout", "timeout_seconds": 30}
@@ -490,13 +448,13 @@ Returned when a handler file cannot be executed.
 
 Returned when a handler exceeds `COMMAND_TIMEOUT`.
 
-### 8.5. Content-Type
+### 7.5. Content-Type
 
 All server-generated error responses have `Content-Type: application/json`.
 
 ---
 
-## 9. Concurrency
+## 8. Concurrency
 
 The server MUST handle multiple requests concurrently. Each handler invocation
 is an independent subprocess — the server does not serialize execution.
@@ -507,7 +465,7 @@ this specification.
 
 ---
 
-## 10. Graceful Shutdown
+## 9. Graceful Shutdown
 
 On receiving `SIGINT` or `SIGTERM` (or platform equivalent), the server:
 
@@ -518,9 +476,9 @@ On receiving `SIGINT` or `SIGTERM` (or platform equivalent), the server:
 
 ---
 
-## 11. Optional Capabilities
+## 10. Optional Capabilities
 
-### 11.1. Automatic route reloading
+### 10.1. Automatic route reloading
 
 An implementation MAY support automatic reloading of the discovered route tree
 after filesystem changes. This capability MAY be implemented either inside the
@@ -561,7 +519,7 @@ standardized capability.
 
 ---
 
-## 12. Non-Requirements
+## 11. Non-Requirements
 
 The following are explicitly out of scope for a conforming implementation:
 
@@ -571,6 +529,9 @@ The following are explicitly out of scope for a conforming implementation:
   validation.
 - **Authentication, authorization, CORS, rate limiting, or any middleware.**
   These belong in a reverse proxy or in the handler scripts themselves.
+- **CGI-style response headers.** The server does not parse handler stdout for
+  headers, status codes, or Content-Type overrides. Handlers that need custom
+  response metadata should use a reverse proxy or application-level conventions.
 - **Response envelope wrapping.** The server does not modify handler output.
   If an application wants `{"status":"ok","data":...}` envelopes, the handlers
   produce them.
@@ -579,41 +540,38 @@ The following are explicitly out of scope for a conforming implementation:
 
 ---
 
-## 13. Compliance Checklist
+## 12. Compliance Checklist
 
 An implementation is conforming if it passes all of the following behavioral
 tests. Each test corresponds to an entry in `spec/test-suite/tests/`.
 
-The base compliance suite covers the required behavior in Sections 1-10 and
-does not currently test the optional capability in Section 11.
+The base compliance suite covers the required behavior in Sections 1–9 and
+does not currently test the optional capability in Section 10.
 
 | # | Test | Requirement |
 |---|------|-------------|
-| 1 | Simple GET returns handler stdout as JSON | §5, §6.2 |
+| 1 | Simple GET returns handler stdout as JSON | §5.3.4 |
 | 2 | POST body is delivered to handler stdin | §5.3.3 |
-| 3 | Path parameters are set in PARAM_* env vars | §7.2.2 |
-| 4 | Query parameters are set in QUERY_* env vars | §7.2.3 |
+| 3 | Path parameters are set in PARAM_* env vars | §6.2.2 |
+| 4 | Query parameters are set in QUERY_* env vars | §6.2.3 |
 | 5 | Literal segments take priority over parameter segments | §4.2 |
-| 6 | Multiple path parameters in one route work | §7.2.2 |
-| 7 | Handler can set status code via `Status:` header | §6.3.1 |
-| 8 | Handler can set custom response headers | §6.3.1 |
-| 9 | Handler can override Content-Type | §6.3.1 |
-| 10 | Non-zero exit with empty stdout uses stderr as body | §5.3.5 |
-| 11 | Handler exceeding timeout returns 504 | §5.3.7 |
-| 12 | Valid path with wrong method returns 405 with Allow header | §4.3 |
-| 13 | No matching path returns 404 | §4.3 |
-| 14 | Non-executable method file is served as static content | §5.2 |
-| 15 | All seven HTTP methods are dispatched correctly | §4.3 |
-| 16 | Request headers are available as HTTP_* env vars | §7.2.4 |
-| 17 | Server environment is inherited by handlers | §7.2.5 |
-| 18 | Handler cwd is set to handler's parent directory | §5.3.2 |
-| 19 | Trailing slashes are normalized | §4.1 |
-| 20 | Hyphens in param/query names become underscores | §7.2.2, §7.2.3 |
-| 21 | Arbitrary file at ROUTE_DIR/<path> is served directly (§4.4 fallback) | §4.4 |
-| 22 | Directory at ROUTE_DIR/<path> returns HTML listing (§4.4 fallback) | §4.4 |
-| 23 | Directory fallback prefers `index.html` over listing | §4.4 |
-| 24 | HTML directory index wins over executable `index.*` | §4.4 |
-| 25 | Executable `index.*` is run when no HTML index exists | §4.4, §5.3 |
-| 26 | Executable `index.*` runs with its parent directory as cwd | §4.4, §5.3.2 |
-| 27 | Executable filesystem fallback file is run and returned as `text/plain` | §4.4 |
-| 28 | Executable filesystem fallback file runs with its parent directory as cwd | §4.4 |
+| 6 | Multiple path parameters in one route work | §6.2.2 |
+| 7 | Non-zero exit with empty stdout uses stderr as body | §5.3.5 |
+| 8 | Handler exceeding timeout returns 504 | §5.3.7 |
+| 9 | Valid path with wrong method returns 405 with Allow header | §4.3 |
+| 10 | No matching path returns 404 | §4.3 |
+| 11 | Non-executable method file is served as static content | §5.2 |
+| 12 | All seven HTTP methods are dispatched correctly | §4.3 |
+| 13 | Request headers are available as HTTP_* env vars | §6.2.4 |
+| 14 | Server environment is inherited by handlers | §6.2.5 |
+| 15 | Handler cwd is set to handler's parent directory | §5.3.2 |
+| 16 | Trailing slashes are normalized | §4.1 |
+| 17 | Hyphens in param/query names become underscores | §6.2.2, §6.2.3 |
+| 18 | Arbitrary file at ROUTE_DIR/<path> is served directly (§4.4 fallback) | §4.4 |
+| 19 | Directory at ROUTE_DIR/<path> returns HTML listing (§4.4 fallback) | §4.4 |
+| 20 | Directory fallback prefers `index.html` over listing | §4.4 |
+| 21 | HTML directory index wins over executable `index.*` | §4.4 |
+| 22 | Executable `index.*` is run when no HTML index exists | §4.4, §5.3 |
+| 23 | Executable `index.*` runs with its parent directory as cwd | §4.4, §5.3.2 |
+| 24 | Executable filesystem fallback file is run and returned as `application/json` | §4.4, §5.3.4 |
+| 25 | Executable filesystem fallback file runs with its parent directory as cwd | §4.4, §5.3.2 |

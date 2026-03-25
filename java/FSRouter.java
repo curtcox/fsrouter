@@ -38,7 +38,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 public class FSRouter {
     private static final Set<String> HTTP_METHODS = Set.of("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS");
@@ -70,7 +69,6 @@ public class FSRouter {
     }
 
     private record MatchResult(Node node, Map<String, String> params) {}
-    private record HeaderParseResult(int status, String contentType, List<Map.Entry<String, String>> headers, byte[] body) {}
     private record RouteItem(String route, String method, Path path, String tag) {}
     private record ListenAddress(String host, int port) {}
     private record HostPort(String host, String port) {}
@@ -180,7 +178,7 @@ public class FSRouter {
 
     private static int serveFallbackFile(HttpExchange exchange, String method, Path path, int timeoutSeconds, String listenAddr) throws IOException {
         if (isExecutable(path)) {
-            return executePlainFile(exchange, method, path, timeoutSeconds, listenAddr);
+            return handleHandler(exchange, method, path, Map.of(), timeoutSeconds, listenAddr);
         }
         return serveStatic(exchange, method, path);
     }
@@ -318,76 +316,16 @@ public class FSRouter {
             System.err.flush();
         }
 
-        byte[] raw = stdout;
-        if (raw.length == 0 && exitCode != 0 && stderr.length > 0) {
-            raw = stderr;
+        byte[] body = stdout;
+        if (body.length == 0 && exitCode != 0 && stderr.length > 0) {
+            body = stderr;
         }
-        return writeCgiResponse(exchange, method, raw, exitCode);
-    }
-
-    private static int executePlainFile(HttpExchange exchange, String method, Path handlerPath, int timeoutSeconds, String listenAddr) throws IOException {
-        byte[] requestBody = readAllBytes(exchange.getRequestBody());
-        ExchangeContext context = new ExchangeContext(method, exchange.getRequestURI(), exchange.getRequestHeaders(), exchange.getRemoteAddress(), listenAddr);
-        Map<String, String> env = buildEnv(context, Map.of());
-        ProcessBuilder builder = new ProcessBuilder(handlerPath.toString());
-        builder.directory(handlerPath.getParent().toFile());
-        builder.environment().clear();
-        builder.environment().putAll(env);
-
-        Process process;
-        try {
-            process = builder.start();
-        } catch (IOException e) {
-            return writeJson(exchange, method, 502, jsonObject(Map.of("error", "exec_failed", "message", e.getMessage())));
-        }
-
-        ExecutorService ioExecutor = Executors.newFixedThreadPool(2);
-        Future<byte[]> stdoutFuture = ioExecutor.submit(readStream(process.getInputStream()));
-        Future<byte[]> stderrFuture = ioExecutor.submit(readStream(process.getErrorStream()));
-        try (OutputStream stdin = process.getOutputStream()) {
-            stdin.write(requestBody);
-        }
-
-        byte[] stdout;
-        byte[] stderr;
-        int exitCode;
-        try {
-            boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                process.waitFor(1, TimeUnit.SECONDS);
-                stdoutFuture.cancel(true);
-                stderrFuture.cancel(true);
-                ioExecutor.shutdownNow();
-                return writeJson(exchange, method, 504, "{\"error\":\"handler_timeout\",\"timeout_seconds\":" + timeoutSeconds + "}");
-            }
-            exitCode = process.exitValue();
-            stdout = stdoutFuture.get();
-            stderr = stderrFuture.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            process.destroyForcibly();
-            ioExecutor.shutdownNow();
-            return writeJson(exchange, method, 500, jsonObject(Map.of("error", "exec_failed", "message", e.getMessage())));
-        } catch (ExecutionException e) {
-            process.destroyForcibly();
-            ioExecutor.shutdownNow();
-            Throwable cause = e.getCause() == null ? e : e.getCause();
-            return writeJson(exchange, method, 500, jsonObject(Map.of("error", "exec_failed", "message", cause.getMessage() == null ? cause.toString() : cause.getMessage())));
-        } finally {
-            ioExecutor.shutdownNow();
-        }
-
-        if (stderr.length > 0) {
-            System.err.printf("  [handler stderr] %s%n", new String(stderr, StandardCharsets.UTF_8).stripTrailing());
-            System.err.flush();
-        }
-
-        Headers headers = exchange.getResponseHeaders();
-        headers.set("Content-Type", "text/plain");
-        headers.set("Content-Length", Integer.toString(stdout.length));
-        sendResponse(exchange, method, exitToStatus(exitCode), stdout);
-        return exitToStatus(exitCode);
+        int status = exitToStatus(exitCode);
+        Headers responseHeaders = exchange.getResponseHeaders();
+        responseHeaders.set("Content-Type", "application/json");
+        responseHeaders.set("Content-Length", Integer.toString(body.length));
+        sendResponse(exchange, method, status, body);
+        return status;
     }
 
     private static int serveStatic(HttpExchange exchange, String method, Path handlerPath) throws IOException {
@@ -406,32 +344,6 @@ public class FSRouter {
         headers.set("Content-Length", Integer.toString(data.length));
         sendResponse(exchange, method, 200, data);
         return 200;
-    }
-
-    private static int writeCgiResponse(HttpExchange exchange, String method, byte[] raw, int exitCode) throws IOException {
-        int status = exitToStatus(exitCode);
-        String contentType = "application/json";
-        List<Map.Entry<String, String>> headers = new ArrayList<>();
-        byte[] body = raw;
-
-        if (raw.length > 0 && looksLikeHeader(raw)) {
-            HeaderParseResult parsed = parseCgiHeaders(raw, status);
-            if (parsed != null) {
-                status = parsed.status();
-                contentType = parsed.contentType();
-                headers = parsed.headers();
-                body = parsed.body();
-            }
-        }
-
-        Headers responseHeaders = exchange.getResponseHeaders();
-        for (Map.Entry<String, String> header : headers) {
-            responseHeaders.add(header.getKey(), header.getValue());
-        }
-        responseHeaders.set("Content-Type", contentType);
-        responseHeaders.set("Content-Length", Integer.toString(body.length));
-        sendResponse(exchange, method, status, body);
-        return status;
     }
 
     private static int writeJson(HttpExchange exchange, String method, int status, String payload) throws IOException {
@@ -635,89 +547,6 @@ public class FSRouter {
         return value.toUpperCase(Locale.ROOT).replace('-', '_');
     }
 
-    private static HeaderParseResult parseCgiHeaders(byte[] raw, int defaultStatus) {
-        int status = defaultStatus;
-        String contentType = "application/json";
-        List<Map.Entry<String, String>> headers = new ArrayList<>();
-        int pos = 0;
-        boolean sawBlank = false;
-
-        while (pos < raw.length) {
-            int newline = indexOf(raw, (byte) '\n', pos);
-            byte[] line;
-            int nextPos;
-            if (newline == -1) {
-                line = slice(raw, pos, raw.length);
-                nextPos = raw.length;
-            } else {
-                line = slice(raw, pos, newline);
-                nextPos = newline + 1;
-            }
-            if (line.length > 0 && line[line.length - 1] == '\r') {
-                line = slice(line, 0, line.length - 1);
-            }
-            if (line.length == 0) {
-                sawBlank = true;
-                pos = nextPos;
-                break;
-            }
-            String text = new String(line, StandardCharsets.UTF_8);
-            Map.Entry<String, String> parsed = parseHeaderLine(text);
-            if (parsed == null) {
-                return null;
-            }
-            String key = parsed.getKey();
-            String value = parsed.getValue();
-            if (key.equalsIgnoreCase("Status")) {
-                String[] parts = value.split("\\s+");
-                if (parts.length > 0) {
-                    try {
-                        status = Integer.parseInt(parts[0]);
-                    } catch (NumberFormatException ignored) {
-                    }
-                }
-            } else if (key.equalsIgnoreCase("Content-Type")) {
-                contentType = value;
-            } else {
-                headers.add(Map.entry(key, value));
-            }
-            pos = nextPos;
-        }
-
-        if (!sawBlank) {
-            return null;
-        }
-        return new HeaderParseResult(status, contentType, headers, slice(raw, pos, raw.length));
-    }
-
-    private static Map.Entry<String, String> parseHeaderLine(String line) {
-        int idx = line.indexOf(':');
-        if (idx <= 0) {
-            return null;
-        }
-        String key = line.substring(0, idx);
-        for (int i = 0; i < key.length(); i++) {
-            char ch = key.charAt(i);
-            if (ch <= 32 || ch == 127) {
-                return null;
-            }
-        }
-        return Map.entry(key, line.substring(idx + 1).trim());
-    }
-
-    private static boolean looksLikeHeader(byte[] raw) {
-        for (int i = 0; i < raw.length; i++) {
-            byte b = raw[i];
-            if (b == ':' && i > 0) {
-                return true;
-            }
-            if (b == '\n' || b == '\r' || b == ' ' || b == '\t') {
-                return false;
-            }
-        }
-        return false;
-    }
-
     private static int exitToStatus(int code) {
         if (code == 0) {
             return 200;
@@ -866,19 +695,4 @@ public class FSRouter {
         return sb.toString();
     }
 
-    private static int indexOf(byte[] data, byte target, int start) {
-        for (int i = start; i < data.length; i++) {
-            if (data[i] == target) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private static byte[] slice(byte[] data, int start, int end) {
-        int len = Math.max(0, end - start);
-        byte[] out = new byte[len];
-        System.arraycopy(data, start, out, 0, len);
-        return out;
-    }
 }
