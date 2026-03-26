@@ -1,1 +1,0 @@
-Add a batch mode that reads a manifest of jobs, submits them with a configurable concurrency limit, polls their status, and supports --resume after interruption.

@@ -1,1 +1,0 @@
-For HTML-to-video-pipeline, add a storyboard mode that renders a contact-sheet style HTML preview and JSON scene manifest before final encoding, then let the CLI or API promote that storyboard into a full render job.

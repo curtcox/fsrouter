@@ -1,1 +1,0 @@
-Improve the main preview page so it works well on mobile, adds semantic landmarks, includes a skip link, and shows a visible warning when an expected asset is missing.
