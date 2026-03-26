@@ -51,6 +51,7 @@ def run_agent_loop(
     requests_log = []
     responses_log = []
     commands_log = []
+    warnings_log = []
 
     if feedback:
         _write_json(log_dir / "feedback.json", feedback)
@@ -71,6 +72,7 @@ def run_agent_loop(
     while True:
         if budget.remaining <= 0:
             _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+            _write_optional_warnings(log_dir, warnings_log)
             return {"type": "budget_exhausted", "summary": _summarize(summary_events, conversation, commands_log)}
 
         request_body = {
@@ -86,6 +88,7 @@ def run_agent_loop(
             requests_log.append(request_body)
             responses_log.append({"error": str(exc)})
             _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+            _write_optional_warnings(log_dir, warnings_log)
             return {"type": "error", "error": str(exc)}
 
         requests_log.append(request_body)
@@ -99,6 +102,7 @@ def run_agent_loop(
             consecutive_validation_failures += 1
             if consecutive_validation_failures >= 3:
                 _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+                _write_optional_warnings(log_dir, warnings_log)
                 return {"type": "error", "error": f"3 consecutive validation failures: {parsed_or_error}"}
             conversation.append(
                 {
@@ -107,6 +111,7 @@ def run_agent_loop(
                 }
             )
             _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+            _write_optional_warnings(log_dir, warnings_log)
             continue
 
         consecutive_validation_failures = 0
@@ -114,6 +119,7 @@ def run_agent_loop(
 
         if parsed["type"] == "answer":
             _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+            _write_optional_warnings(log_dir, warnings_log)
             return parsed["answer"]
 
         command_result = _handle_commands(
@@ -132,9 +138,11 @@ def run_agent_loop(
             sleep_fn=sleep_fn,
             command_timeout=command_timeout,
             summary_events=summary_events,
+            warnings_log=warnings_log,
         )
         if command_result.get("terminal") is not None:
             _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+            _write_optional_warnings(log_dir, warnings_log)
             return command_result["terminal"]
 
         conversation.append(
@@ -147,6 +155,7 @@ def run_agent_loop(
             }
         )
         _write_logs(log_dir, requests_log, responses_log, conversation, commands_log)
+        _write_optional_warnings(log_dir, warnings_log)
 
 
 def _handle_commands(
@@ -166,11 +175,13 @@ def _handle_commands(
     sleep_fn,
     command_timeout,
     summary_events,
+    warnings_log,
 ):
     results = []
     cache, cache_warning = _load_safety_cache(data_dir / "safety-cache.json")
     if cache_warning:
         summary_events.append(cache_warning)
+        warnings_log.append(cache_warning)
 
     for command_item in commands:
         entry = {
@@ -591,6 +602,11 @@ def _write_logs(log_dir, requests_log, responses_log, conversation, commands_log
 def _write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_optional_warnings(log_dir, warnings_log):
+    if warnings_log:
+        _write_json(log_dir / "warnings.json", warnings_log)
 
 
 def _make_openrouter_client():
