@@ -1,5 +1,10 @@
 import json
+import os
+import socket
+import subprocess
 import tempfile
+import time
+import urllib.request
 import unittest
 from pathlib import Path
 
@@ -98,6 +103,8 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual("assistant", conversation[1]["role"])
         self.assertIn("add feature", requests[0]["messages"][0]["content"])
         self.assertIn('"type":"answer"', requests[0]["messages"][0]["content"])
+        self.assertFalse((self.log_dir / "commands.json").exists())
+        self.assertFalse((self.log_dir / "feedback.json").exists())
 
     def test_multi_turn_command_review_and_answer(self):
         client = FakeClient(
@@ -159,6 +166,10 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual("review", commands[0]["safety"]["source"])
         self.assertEqual("echo *", cache[0]["pattern"])
         self.assertEqual(["system", "assistant", "user", "assistant"], [item["role"] for item in conversation])
+        requests = json.loads((self.log_dir / "request.json").read_text(encoding="utf-8"))
+        responses = json.loads((self.log_dir / "response.json").read_text(encoding="utf-8"))
+        self.assertEqual(3, len(requests))
+        self.assertEqual(3, len(responses))
 
     def test_multiple_cached_commands_in_one_turn_only_spends_primary_budget(self):
         client = FakeClient(
@@ -697,6 +708,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual("system", request_log[0]["messages"][0]["role"])
         self.assertEqual("user", request_log[0]["messages"][1]["role"])
         self.assertIn("avoid shell pipes", request_log[0]["messages"][1]["content"])
+        self.assertEqual("primary", request_log[0]["model"])
 
     def test_cache_hit_rejected_returns_rejected_status_without_review_call(self):
         client = FakeClient(
@@ -1254,8 +1266,10 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("3 consecutive validation failures", result["error"])
         requests = json.loads((self.log_dir / "request.json").read_text(encoding="utf-8"))
         responses = json.loads((self.log_dir / "response.json").read_text(encoding="utf-8"))
+        conversation = json.loads((self.log_dir / "conversation.json").read_text(encoding="utf-8"))
         self.assertEqual(3, len(requests))
         self.assertEqual(3, len(responses))
+        self.assertEqual("assistant", conversation[-1]["role"])
 
     def test_validation_failure_counter_resets_after_valid_command_turn(self):
         client = FakeClient(
@@ -1491,6 +1505,10 @@ class AgentLoopTests(unittest.TestCase):
         )
 
         self.assertEqual("user_aborted", result["type"])
+        self.assertTrue((self.log_dir / "request.json").exists())
+        self.assertTrue((self.log_dir / "response.json").exists())
+        commands = json.loads((self.log_dir / "commands.json").read_text(encoding="utf-8"))
+        self.assertIsNone(commands[0]["execution"])
 
     def test_missing_prompt_file_returns_error(self):
         client = FakeClient([])
@@ -1558,6 +1576,246 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn('"summary"', system_message)
         self.assertIn('{"type":"command"', system_message)
         self.assertIn('{"type":"answer"', system_message)
+
+    def test_response_body_is_logged_verbatim(self):
+        raw = make_response(
+            json.dumps(
+                {"type": "answer", "answer": {"summary": "done"}},
+                separators=(",", ":"),
+            )
+        )
+        client = FakeClient([raw])
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=BudgetRef(remaining=2),
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        responses = json.loads((self.log_dir / "response.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw, responses[0])
+
+    def test_same_model_for_primary_and_review_still_works(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "echo hello", "purpose": "test"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "echo *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="same-model",
+            review_model="same-model",
+            budget=BudgetRef(remaining=5),
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        requests = json.loads((self.log_dir / "request.json").read_text(encoding="utf-8"))
+        self.assertEqual({"summary": "done"}, result)
+        self.assertEqual("same-model", requests[0]["model"])
+        self.assertEqual("same-model", requests[1]["model"])
+
+
+@unittest.skipUnless(os.environ.get("OPENROUTER_API_KEY"), "OPENROUTER_API_KEY not set")
+class AgentLoopIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.working_dir = self.root / "app"
+        self.working_dir.mkdir()
+        self.routes_dir = self.working_dir / "routes"
+        self.routes_dir.mkdir()
+        self.prompts_dir = self.working_dir / "prompts"
+        self.prompts_dir.mkdir()
+        self.data_dir = self.working_dir / "data"
+        self.data_dir.mkdir()
+        self.logs_dir = self.working_dir / "logs"
+        self.logs_dir.mkdir()
+        (self.prompts_dir / "build.txt").write_text(
+            (
+                "Build the requested fsrouter web app inside routes/.\n"
+                "You may run local shell commands to inspect the environment and create files.\n"
+                "When finished, return a short summary of what you built.\n"
+                "Request: {{change_description}}\n"
+                "Context: {{context}}\n"
+            ),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _free_port(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+
+    def _start_server(self):
+        port = self._free_port()
+        env = os.environ.copy()
+        env["ROUTE_DIR"] = str(self.routes_dir)
+        env["LISTEN_ADDR"] = f"127.0.0.1:{port}"
+        env["COMMAND_TIMEOUT"] = "30"
+        server = subprocess.Popen(
+            ["python3", "/Users/curt/me/fsrouter/python/fsrouter.py"],
+            cwd="/Users/curt/me/fsrouter",
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base_url = f"http://127.0.0.1:{port}"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(base_url + "/") as response:
+                    response.read()
+                    return server, base_url
+            except Exception:
+                time.sleep(0.2)
+        server.terminate()
+        server.wait(timeout=5)
+        self.fail("fsrouter server did not start")
+
+    def _run_build(self, change_description, change_id):
+        return run_agent_loop(
+            goal="build",
+            template_vars={"change_description": change_description, "context": "Create files directly under routes/ as needed."},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model=os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1"),
+            review_model=os.environ.get("OPENROUTER_REVIEW_MODEL", os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1-mini")),
+            budget=BudgetRef(remaining=int(os.environ.get("AGENT_LOOP_TEST_BUDGET", "25"))),
+            log_dir=self.logs_dir / change_id,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+        )
+
+    def _read_text_if_exists(self, path):
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_qr_code_reader_integration(self):
+        result = self._run_build(
+            (
+                "Create a web app with a page that opens the device camera, detects QR codes in the "
+                "video feed, and displays the decoded contents. When a QR code is detected, present "
+                "actions that fit the content and always include Say it and Use as change prompt."
+            ),
+            "qr-code-reader",
+        )
+        self.assertNotIn(result.get("type") if isinstance(result, dict) else None, {"error", "budget_exhausted", "user_aborted"})
+        self.assertTrue(any(self.routes_dir.rglob("*")))
+        commands = json.loads((self.logs_dir / "qr-code-reader" / "commands.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("routes" in entry["command"] or "find" in entry["command"] or "ls" in entry["command"] for entry in commands))
+        server, base_url = self._start_server()
+        try:
+            html = urllib.request.urlopen(base_url + "/").read().decode("utf-8", errors="replace")
+        finally:
+            server.terminate()
+            server.wait(timeout=5)
+        self.assertTrue("<video" in html or "getUserMedia" in html)
+        self.assertTrue("jsQR" in html or "zxing" in html or "qr" in html.lower())
+        self.assertTrue("Say it" in html or "say it" in html.lower())
+        self.assertIn("change", html.lower())
+
+    def test_network_scanner_integration(self):
+        result = self._run_build(
+            (
+                "Create a web app that scans the local network on the server side, shows progress, "
+                "renders results in a table, and includes a topology graph."
+            ),
+            "network-scanner",
+        )
+        self.assertNotIn(result.get("type") if isinstance(result, dict) else None, {"error", "budget_exhausted", "user_aborted"})
+        commands = json.loads((self.logs_dir / "network-scanner" / "commands.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(("which nmap" in entry["command"]) or ("which arp" in entry["command"]) or ("command -v" in entry["command"]) for entry in commands))
+        server, base_url = self._start_server()
+        try:
+            html = urllib.request.urlopen(base_url + "/").read().decode("utf-8", errors="replace")
+        finally:
+            server.terminate()
+            server.wait(timeout=5)
+        self.assertTrue("<table" in html or "services" in html.lower())
+        self.assertTrue("svg" in html.lower() or "canvas" in html.lower() or "graph" in html.lower())
+        self.assertTrue("setInterval" in html or "setTimeout" in html or "fetch(" in html)
+
+    def test_scheduler_frontend_integration(self):
+        result = self._run_build(
+            (
+                "Create a web app frontend for cron and launchd task management on macOS, including "
+                "listing tasks, adding cron jobs, removing cron jobs, enabling and disabling launchd "
+                "agents, and confirming destructive actions."
+            ),
+            "scheduler",
+        )
+        self.assertNotIn(result.get("type") if isinstance(result, dict) else None, {"error", "budget_exhausted", "user_aborted"})
+        commands = json.loads((self.logs_dir / "scheduler" / "commands.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(("crontab -l" in entry["command"]) or ("launchctl list" in entry["command"]) or ("LaunchAgents" in entry["command"]) for entry in commands))
+        server, base_url = self._start_server()
+        try:
+            html = urllib.request.urlopen(base_url + "/").read().decode("utf-8", errors="replace")
+        finally:
+            server.terminate()
+            server.wait(timeout=5)
+        self.assertTrue("<table" in html or "scheduled" in html.lower())
+        self.assertTrue("form" in html.lower() or "schedule" in html.lower())
+        self.assertTrue("confirm(" in html or "remove" in html.lower())
 
     def test_cache_pattern_wildcard_matching(self):
         client = FakeClient(
