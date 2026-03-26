@@ -2029,7 +2029,7 @@ def render_recent_changes(changes: list[dict]) -> str:
     items = []
     for change in changes:
         items.append(
-            f"<li><a href=\"/changes/{e(change['id'])}\">{e(change['description'])}</a>"
+            f"<li><a href=\"/changes/{e(change['id'])}/detail\">{e(change['description'])}</a>"
             f" <span class=\"status-chip\">{e(change['status'])}</span>"
             f" <span class=\"meta\">{e(change['created_at'])}</span></li>"
         )
@@ -2192,7 +2192,7 @@ def handle_home() -> None:
     emit_json(
         {
             "app": "fsrouter-ai-change-assistant",
-            "message": "Use POST /changes to queue a request, then poll GET /changes/:id for status.",
+            "message": "Use POST /changes to queue a request, then poll /changes/:id/detail for status.",
             "model_notice": model_notice,
             "models": models,
             "selected_model": selected_model,
@@ -2204,13 +2204,13 @@ def handle_home() -> None:
             "setup": setup,
             "endpoints": {
                 "create_change": "/changes (POST)",
-                "change_detail": "/changes/:id (GET)",
+                "change_detail": "/changes/:id/detail",
                 "change_action": "/changes/:id (POST)",
                 "favorites": "/preferences (POST)",
-                "file_slice": "/file?path=...&start=...&end=... (GET)",
-                "context_item": "/context?change=...&index=... (GET)",
-                "diff_item": "/diff?change=...&index=... (GET)",
-                "ai_call_log": "/ai-call?change=...&call=... (GET)",
+                "file_slice": "/file?path=...&start=...&end=...",
+                "context_item": "/context?change=...&index=...",
+                "diff_item": "/diff?change=...&index=...",
+                "ai_call_log": "/ai-call?change=...&call=...",
             },
         }
     )
@@ -2278,7 +2278,7 @@ def handle_change_post() -> None:
         {
             "status": "queued",
             "change_id": change_id,
-            "change_path": f"/changes/{change_id}",
+            "change_path": f"/changes/{change_id}/detail",
             "poll_after_seconds": REFRESH_SECONDS,
             "description": description,
             "model": model,

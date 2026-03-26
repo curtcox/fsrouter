@@ -23,7 +23,10 @@ This example serves `examples/ai` directly as `ROUTE_DIR`:
 
 - Ordinary files remain directly reachable through filesystem fallback (for
   example `/starter-prompts/...`, `/assets/...`, `/logs/ai/...`).
-- Dynamic behavior is exposed via method files in the same tree.
+- Dynamic behavior is exposed mostly through implicit executable handlers
+  (`index.py`, `file`, `context`, `diff`, `ai-call`, etc.).
+- Method files are used only for `POST` endpoints that share the same URL path
+  segment namespace (for example `/changes/:id` actions).
 
 ## Run
 
@@ -47,7 +50,7 @@ curl -s http://localhost:8080/ | jq .
 - `POST /changes`
   - Queue a new change request (`description`, `model`, `ai_budget`, optional
     `favorite_model=1`).
-- `GET /changes/:id`
+- `GET /changes/:id/detail`
   - Full workflow state (`request`, `state`, `result`, `events`, `ai_calls`).
 - `POST /changes/:id`
   - Risk-review actions while paused (`action=ignore_risk` or
@@ -81,4 +84,4 @@ curl -s http://localhost:8080/ | jq .
 - Prompt templates live in `examples/ai/prompts/` as plain text files.
 - Starter prompts live in `examples/ai/starter-prompts/`.
 - The change worker runs in a detached subprocess so create/action endpoints can
-  return immediately while clients poll `/changes/:id`.
+  return immediately while clients poll `/changes/:id/detail`.
