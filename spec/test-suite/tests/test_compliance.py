@@ -430,18 +430,53 @@ printf '{\"done\":true}'"""))
                 self.assertIn("text/plain", headers.get_content_type())
                 self.assertEqual(body.decode("utf-8"), "hello from notes")
 
-    def test_executable_file_in_route_dir_is_run_as_json(self):
+    def test_executable_non_method_file_is_registered_as_implicit_handler(self):
         with self.make_routes() as temp_dir:
             routes = Path(temp_dir)
             tools = routes / "tools"
             tools.mkdir()
             (tools / "value.txt").write_text("from-exec-file", encoding="utf-8")
-            self.write_handler(routes, "tools/report.txt", self.shell("""cat value.txt"""))
+            self.write_handler(routes, "tools/report", self.shell("""cat value.txt"""))
             with RunningServer(self.command, self.command_cwd, routes) as server:
-                status, headers, body = server.request("GET", "/tools/report.txt")
+                status, headers, body = server.request("GET", "/tools/report")
                 self.assertEqual(status, 200)
                 self.assertEqual(headers.get_content_type(), "application/json")
                 self.assertEqual(body.decode("utf-8"), "from-exec-file")
+
+    def test_implicit_handler_cwd_is_set_to_parent_directory(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            tools = routes / "tools"
+            tools.mkdir()
+            (tools / "value.txt").write_text("from-parent-dir", encoding="utf-8")
+            self.write_handler(routes, "tools/report", self.shell("""cat value.txt"""))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, _, body = server.request("GET", "/tools/report")
+                self.assertEqual(status, 200)
+                self.assertEqual(body.decode("utf-8"), "from-parent-dir")
+
+    def test_implicit_handler_responds_to_any_http_method(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            self.write_handler(routes, "endpoint", self.shell(
+                """printf '{"method":"%s"}' "${REQUEST_METHOD}" """
+            ))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                for method in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
+                    status, _, body = server.request(method, "/endpoint")
+                    self.assertEqual(status, 200, f"implicit handler should accept {method}")
+                    self.assertEqual(self.parse_json(body), {"method": method})
+
+    def test_implicit_handler_receives_path_parameters(self):
+        with self.make_routes() as temp_dir:
+            routes = Path(temp_dir)
+            self.write_handler(routes, "users/:id/profile", self.shell(
+                """printf '{"id":"%s"}' "${PARAM_ID}" """
+            ))
+            with RunningServer(self.command, self.command_cwd, routes) as server:
+                status, _, body = server.request("GET", "/users/42/profile")
+                self.assertEqual(status, 200)
+                self.assertEqual(self.parse_json(body), {"id": "42"})
 
     def test_directory_in_route_dir_returns_html_listing(self):
         with self.make_routes() as temp_dir:

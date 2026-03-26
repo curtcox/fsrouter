@@ -10,32 +10,42 @@ with any conforming fsrouter server implementation.
 ## Core Concept
 
 Your directory tree **is** your router. There is no routing config, no
-annotations, no code-level route registration. Every URL maps to a file or
-directory under `ROUTE_DIR` (default: `./routes`).
+annotations, no code-level route registration. Every executable file in
+`ROUTE_DIR` (default: `./routes`) is a handler at the URL matching its
+filesystem path.
+
+The simplest possible web app is a single executable file:
+
+```
+routes/
+  hello               # executable → handles ALL methods at /hello
+```
+
+Method files (files named `GET`, `POST`, etc.) are the exception — use them
+only when you need per-method dispatch at a single path.
 
 ---
 
 ## Quick Start
 
-1. Create a route directory with method files:
+1. Create a route directory with handlers:
 
 ```
 routes/
-  GET                  # GET /
+  hello               # handles /hello (all methods)
+  health              # handles /health (all methods)
   users/
-    GET                # GET /users
-    POST               # POST /users
+    GET                # handles GET /users specifically
+    POST               # handles POST /users specifically
     :id/
-      GET              # GET /users/:id
-      PUT              # PUT /users/:id
-      DELETE           # DELETE /users/:id
+      profile          # handles /users/:id/profile (all methods)
 ```
 
 2. Make handlers executable and add a shebang:
 
 ```bash
-chmod +x routes/GET routes/users/GET routes/users/POST
-chmod +x routes/users/:id/GET routes/users/:id/PUT routes/users/:id/DELETE
+chmod +x routes/hello routes/health routes/users/GET routes/users/POST
+chmod +x routes/users/:id/profile
 ```
 
 3. Start any fsrouter server:
@@ -49,15 +59,57 @@ ROUTE_DIR=./routes python3 python/fsrouter.py
 
 ---
 
+## Two Kinds of Handlers
+
+### Implicit Handlers (the default)
+
+An executable file whose name is **not** an HTTP method handles **all
+methods** at its URL path. The filename becomes part of the URL.
+
+```
+routes/health         # /health    — handles GET, POST, PUT, etc.
+routes/api/status     # /api/status — handles all methods
+```
+
+The handler receives `REQUEST_METHOD` in its environment and can
+differentiate if needed:
+
+```bash
+#!/bin/sh
+echo "{\"method\": \"$REQUEST_METHOD\"}"
+```
+
+**Use implicit handlers when:**
+- The endpoint only needs one behavior (most endpoints)
+- You want the simplest possible structure
+- Method dispatch isn't important
+
+### Method Files (the exception)
+
+Files named after HTTP methods (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`,
+`HEAD`, `OPTIONS`) handle only that specific method. The filename is consumed
+as routing metadata — it doesn't appear in the URL.
+
+```
+routes/users/
+  GET                 # GET /users only
+  POST                # POST /users only
+```
+
+Unhandled methods at a path with method files return **405 Method Not
+Allowed**.
+
+**Use method files when:**
+- Different methods need completely different logic
+- You want the server to enforce allowed methods with 405 responses
+
+---
+
 ## Writing Handlers
 
 ### Executable Handlers (Dynamic Endpoints)
 
-An executable handler is any method file with the execute bit set. It runs as
-a subprocess and communicates via stdin/stdout/stderr and environment
-variables.
-
-**Minimal handler** (`routes/hello/GET`):
+**Minimal handler** (`routes/hello`):
 
 ```bash
 #!/bin/sh
@@ -91,9 +143,6 @@ fixed responses.
 routes/health/GET     # contains: {"status": "ok"}  (not executable)
 ```
 
-This serves the literal file contents with `Content-Type: application/json`
-(inferred from file content/extension).
-
 ---
 
 ## Receiving Request Data
@@ -103,7 +152,7 @@ This serves the literal file contents with `Content-Type: application/json`
 Directories prefixed with `:` capture URL segments as environment variables:
 
 ```
-routes/users/:id/GET          # PARAM_ID=42       for GET /users/42
+routes/users/:id/profile      # PARAM_ID=42       for /users/42/profile
 routes/hosts/:hostname/GET    # PARAM_HOSTNAME=sw1 for GET /hosts/sw1
 ```
 
@@ -214,9 +263,8 @@ exit code is non-zero.
 
 ## Static Files and Filesystem Fallback
 
-Any file in the route directory that is **not** a method file is served at its
-corresponding URL path. This is the filesystem fallback — it kicks in when no
-handler route matches.
+Non-executable, non-method files in the route directory are served at their
+corresponding URL path via filesystem fallback:
 
 ```
 routes/
@@ -242,13 +290,13 @@ Directory index resolution order:
    and `routes/users/:id/GET` exist, `GET /users/me` always hits the literal
    `me` directory.
 
-2. **Handler routes beat filesystem fallback.** If `routes/data/GET` exists
-   (a method file), `GET /data` dispatches to that handler — even if a regular
-   file named `data` also exists at that path.
+2. **Method files beat implicit handlers.** If `routes/items/GET` exists as a
+   method file, `GET /items` dispatches to it. Other methods at that path
+   return 405 (because method files claim the path).
 
-3. **Method files claim the path.** If `routes/items/GET` exists but there is
-   no `routes/items/POST`, then `POST /items` returns 405 (not filesystem
-   fallback).
+3. **Registered routes beat filesystem fallback.** Implicit handlers and
+   method files are registered at startup. Filesystem fallback is a last
+   resort for non-executable files.
 
 ---
 
@@ -256,18 +304,15 @@ Directory index resolution order:
 
 ### Shared Logic
 
-Put shared code in non-method files (e.g., `lib/`) alongside your routes.
-Since the handler's working directory is its parent, use relative paths or
-path traversal to find shared modules:
+Put shared code in non-executable files (e.g., `lib/`). Since the handler's
+working directory is its parent, use relative paths to find shared modules:
 
 ```
 routes/
   lib/
     db.py
     helpers.py
-  users/
-    GET              # can import from ../lib/
-    POST
+  users               # implicit handler for /users
   orders/
     GET
     :id/
@@ -282,7 +327,7 @@ from pathlib import Path
 import sys
 
 # Find lib relative to this handler
-lib = Path(__file__).resolve().parent.parent / "lib"
+lib = Path(__file__).resolve().parent / "lib"
 sys.path.insert(0, str(lib))
 
 from db import get_users
@@ -330,49 +375,40 @@ routes/
 
 ```
 routes/
+  todos               # List todos (GET) or create (POST) — implicit handler
   todos/
-    GET              # List all todos
-    POST             # Create a todo
     :id/
-      GET            # Get one todo
-      PUT            # Update a todo
-      DELETE          # Delete a todo
+      todo            # Get, update, or delete a specific todo
   lib/
-    store.py         # Shared storage logic
+    store.py          # Shared storage logic
 ```
 
-`routes/todos/GET`:
+`routes/todos`:
 
 ```python
 #!/usr/bin/env python3
 from pathlib import Path
-import sys, json
+import os, sys, json
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from store import list_todos
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from store import list_todos, create_todo
 
-print(json.dumps(list_todos()))
-```
+method = os.environ["REQUEST_METHOD"]
 
-`routes/todos/POST`:
-
-```python
-#!/usr/bin/env python3
-from pathlib import Path
-import sys, json
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from store import create_todo
-
-body = json.load(sys.stdin)
-if "title" not in body:
-    print(json.dumps({"error": "title required"}), file=sys.stderr)
+if method == "GET":
+    print(json.dumps(list_todos()))
+elif method == "POST":
+    body = json.load(sys.stdin)
+    if "title" not in body:
+        print(json.dumps({"error": "title required"}), file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(create_todo(body["title"])))
+else:
+    print(json.dumps({"error": "not supported"}), file=sys.stderr)
     sys.exit(1)
-
-print(json.dumps(create_todo(body["title"])))
 ```
 
-`routes/todos/:id/DELETE`:
+`routes/todos/:id/todo`:
 
 ```python
 #!/usr/bin/env python3
@@ -380,15 +416,39 @@ from pathlib import Path
 import os, sys, json
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
-from store import delete_todo
+from store import get_todo, delete_todo
 
 todo_id = os.environ["PARAM_ID"]
-if not delete_todo(todo_id):
-    print(json.dumps({"error": "not found"}), file=sys.stderr)
-    sys.exit(1)
+method = os.environ["REQUEST_METHOD"]
 
-print(json.dumps({"deleted": todo_id}))
+if method == "GET":
+    todo = get_todo(todo_id)
+    if not todo:
+        print(json.dumps({"error": "not found"}), file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(todo))
+elif method == "DELETE":
+    if not delete_todo(todo_id):
+        print(json.dumps({"error": "not found"}), file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"deleted": todo_id}))
 ```
+
+Or use method files when per-method dispatch is cleaner:
+
+```
+routes/
+  todos/
+    GET              # List all todos
+    POST             # Create a todo
+    :id/
+      GET            # Get one todo
+      DELETE          # Delete a todo
+  lib/
+    store.py
+```
+
+Both structures work. Choose whichever is simpler for your use case.
 
 ---
 
@@ -398,7 +458,7 @@ Before running your app, verify:
 
 - [ ] Every handler file has a shebang line (`#!/bin/sh`, `#!/usr/bin/env python3`, etc.)
 - [ ] Every handler file is executable (`chmod +x`)
-- [ ] Method files are named with uppercase HTTP methods (`GET`, `POST`, etc.)
+- [ ] Method files (if used) are named with uppercase HTTP methods (`GET`, `POST`, etc.)
 - [ ] Parameter directories start with `:` (e.g., `:id`, `:name`)
 - [ ] Handlers write JSON to stdout (the default Content-Type)
 - [ ] Error responses use exit code 1 (client error) or 2+ (server error)

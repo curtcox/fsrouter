@@ -23,6 +23,7 @@ class Node:
     param: Optional["Node"] = None
     param_name: str = ""
     handlers: dict[str, Path] = field(default_factory=dict)
+    implicit_handler: Optional[Path] = None
 
     def match(self, segs: list[str]) -> tuple[Optional["Node"], Optional[dict[str, str]]]:
         params: dict[str, str] = {}
@@ -85,27 +86,32 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         node, params = self.server.root.match(segs)
-        if node is None or not node.handlers:
+        if node is None or (not node.handlers and node.implicit_handler is None):
             status = self.serve_filesystem_fallback(segs, parsed.path)
             self.log_result(status, start)
             return
 
         handler_path = node.handlers.get(self.command)
-        if handler_path is None:
-            allowed = sorted(node.handlers)
-            body = json.dumps({"error": "method_not_allowed", "allow": allowed}, separators=(",", ":")).encode()
-            self.send_response(405)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Allow", ", ".join(allowed))
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
-            self.log_result(405, start)
+        if handler_path is not None:
+            status = self.handle_handler(handler_path, params or {})
+            self.log_result(status, start)
             return
 
-        status = self.handle_handler(handler_path, params or {})
-        self.log_result(status, start)
+        if node.implicit_handler is not None:
+            status = self.handle_handler(node.implicit_handler, params or {})
+            self.log_result(status, start)
+            return
+
+        allowed = sorted(node.handlers)
+        body = json.dumps({"error": "method_not_allowed", "allow": allowed}, separators=(",", ":")).encode()
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Allow", ", ".join(allowed))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.log_result(405, start)
 
     def handle_handler(self, handler_path: Path, params: dict[str, str]) -> int:
         try:
@@ -281,21 +287,37 @@ def build_tree(route_dir: str) -> Node:
     for current_root, _, files in os.walk(abs_dir, followlinks=True):
         current_root_path = Path(current_root)
         for filename in files:
-            method = filename.upper()
-            if method not in HTTP_METHODS:
-                continue
             file_path = current_root_path / filename
-            rel = file_path.parent.relative_to(abs_dir)
-            segs = [segment for segment in rel.as_posix().split("/") if segment and segment != "."]
-            cur = root
-            for seg in segs:
-                if seg.startswith(":"):
-                    if cur.param is None:
-                        cur.param = Node(param_name=seg[1:])
-                    cur = cur.param
-                else:
-                    cur = cur.literal.setdefault(seg, Node())
-            cur.handlers[method] = file_path
+            method = filename.upper()
+            if method in HTTP_METHODS:
+                rel = file_path.parent.relative_to(abs_dir)
+                segs = [segment for segment in rel.as_posix().split("/") if segment and segment != "."]
+                cur = root
+                for seg in segs:
+                    if seg.startswith(":"):
+                        if cur.param is None:
+                            cur.param = Node(param_name=seg[1:])
+                        cur = cur.param
+                    else:
+                        cur = cur.literal.setdefault(seg, Node())
+                cur.handlers[method] = file_path
+            else:
+                try:
+                    if not is_executable(file_path.stat()):
+                        continue
+                except OSError:
+                    continue
+                rel = file_path.relative_to(abs_dir)
+                segs = [segment for segment in rel.as_posix().split("/") if segment and segment != "."]
+                cur = root
+                for seg in segs:
+                    if seg.startswith(":"):
+                        if cur.param is None:
+                            cur.param = Node(param_name=seg[1:])
+                        cur = cur.param
+                    else:
+                        cur = cur.literal.setdefault(seg, Node())
+                cur.implicit_handler = file_path
     return root
 
 
@@ -307,6 +329,8 @@ def collect_routes(node: Node, prefix: str, items: list[tuple[str, str, Path, st
         except OSError:
             tag = "unknown"
         items.append((route, method, path, tag))
+    if node.implicit_handler is not None:
+        items.append((route, "*", node.implicit_handler, "exec"))
     for seg in sorted(node.literal):
         collect_routes(node.literal[seg], join_prefix(prefix, seg), items)
     if node.param is not None:

@@ -1,6 +1,6 @@
 # fsrouter Protocol Specification
 
-**Version:** 2.0.0
+**Version:** 2.1.0
 
 This document defines the behavior of a conforming fsrouter implementation. It is
 the authoritative reference — when an implementation disagrees with this document,
@@ -52,6 +52,12 @@ conventionally uppercase) is one of the seven standard HTTP methods: `GET`,
 handler is classified as either *executable* or *static* based on its file
 permissions.
 
+**Implicit handler**: An executable file in the route tree whose name is not
+an HTTP method. It handles all HTTP methods at the URL path corresponding to
+its full filesystem path relative to the route directory. Unlike a method
+file, its filename becomes a URL segment rather than being consumed as routing
+metadata.
+
 ---
 
 ## 3. Route Discovery
@@ -60,8 +66,11 @@ permissions.
 
 At startup, the server recursively walks the route directory. For every file
 encountered, the server checks whether the filename (after uppercasing) is a
-recognized HTTP method. All other files are ignored — they may exist alongside
-method files (as templates, helper data, etc.) without affecting routing.
+recognized HTTP method. If so, it is registered as a method handler. If not,
+and the file is executable, it is registered as an implicit handler.
+Non-executable, non-method files are not registered during scanning — they
+remain reachable through filesystem fallback (§4.4) and may exist alongside
+handlers (as templates, helper data, etc.) without affecting routing.
 
 Symlinks are followed. If a method file is a symlink to another file, the
 resolved target determines whether it is executable or static.
@@ -77,10 +86,24 @@ the registered route is:
     Method:   GET
     Pattern:  /api/v1/users/:id
 
-This is the one place where filesystem paths and URL paths intentionally differ:
-the method filename is consumed as routing metadata rather than appearing in the
-URL. Every other file in the route directory is reachable at exactly its
-filesystem path relative to `ROUTE_DIR`.
+Method files are the one place where filesystem paths and URL paths
+intentionally differ: the method filename is consumed as routing metadata
+rather than appearing in the URL.
+
+For each discovered implicit handler, the server registers a route by
+decomposing the file's full path (including filename) relative to the route
+directory into segments:
+
+Given `ROUTE_DIR=./routes` and an executable file at `./routes/api/health`,
+the registered route is:
+
+    Method:   (all)
+    Pattern:  /api/health
+
+Implicit handlers preserve the 1-to-1 correspondence between filesystem
+paths and URL paths — the filename appears in the URL, and no directory
+wrapper is needed. Every file in the route directory is reachable at exactly
+its filesystem path relative to `ROUTE_DIR`.
 
 ### 3.3. Startup logging
 
@@ -89,8 +112,10 @@ format:
 
     <METHOD>  <PATTERN>  →  <ABSOLUTE_FILE_PATH>  [<TYPE>]
 
-where `<TYPE>` is `exec` if the file is executable, `static` otherwise. Routes
-SHOULD be logged in sorted order (by pattern, then method) for readability.
+where `<METHOD>` is the HTTP method for method handlers or `*` for implicit
+handlers, and `<TYPE>` is `exec` if the file is executable, `static`
+otherwise. Routes SHOULD be logged in sorted order (by pattern, then method)
+for readability.
 
 ### 3.4. Errors during scanning
 
@@ -128,16 +153,22 @@ configurable.
 
 ### 4.3. Method matching
 
-After path matching succeeds, the server checks whether the matched node has a
-handler for the request's HTTP method.
+After path matching succeeds, the server checks what handlers the matched
+node has, in this order:
 
-- If yes, dispatch to that handler.
-- If no, but handlers exist for *other* methods at that node, return
-  **405 Method Not Allowed** with an `Allow` header listing the available
-  methods. Note: the presence of any method file at a node claims that path
-  for handler routing — filesystem fallback (§4.4) is not consulted, even
-  for methods that have no handler at that node.
-- If path matching itself failed (no node matched), proceed to **§4.4 Filesystem Fallback**.
+1. If the node has a **method-specific handler** for the request's HTTP
+   method, dispatch to that handler.
+2. If the node has an **implicit handler**, dispatch to it. The implicit
+   handler receives `REQUEST_METHOD` in its environment and may use it to
+   differentiate methods if needed.
+3. If the node has method-specific handlers for *other* methods (but not
+   the requested one, and no implicit handler), return **405 Method Not
+   Allowed** with an `Allow` header listing the available methods. The
+   presence of any method file at a node claims that path for handler
+   routing — filesystem fallback (§4.4) is not consulted, even for methods
+   that have no handler at that node.
+4. If path matching itself failed (no node matched), proceed to
+   **§4.4 Filesystem Fallback**.
 
 ### 4.4. Filesystem Fallback
 
@@ -573,5 +604,7 @@ does not currently test the optional capability in Section 10.
 | 21 | HTML directory index wins over executable `index.*` | §4.4 |
 | 22 | Executable `index.*` is run when no HTML index exists | §4.4, §5.3 |
 | 23 | Executable `index.*` runs with its parent directory as cwd | §4.4, §5.3.2 |
-| 24 | Executable filesystem fallback file is run and returned as `application/json` | §4.4, §5.3.4 |
-| 25 | Executable filesystem fallback file runs with its parent directory as cwd | §4.4, §5.3.2 |
+| 24 | Executable non-method file is registered and run as implicit handler | §3.1, §3.2, §5.3.4 |
+| 25 | Implicit handler runs with its parent directory as cwd | §3.2, §5.3.2 |
+| 26 | Implicit handler responds to any HTTP method | §4.3 |
+| 27 | Implicit handler receives path parameters | §3.2, §6.2.2 |
