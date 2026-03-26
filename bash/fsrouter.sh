@@ -120,6 +120,22 @@ build_route_table() {
     fi
     printf '%s\t%s\t%s\t%s\n' "$route" "$method" "$path" "$kind" >> "$ROUTE_TABLE"
   done < <(find "$ROUTE_DIR_ABS" -type f | sort)
+  # Register implicit handlers (executable non-method files)
+  while IFS= read -r path; do
+    local filename method rel route kind
+    filename=$(basename "$path")
+    method=$(printf '%s' "$filename" | tr '[:lower:]' '[:upper:]')
+    contains_method "$method" && continue
+    [[ -x "$path" ]] || continue
+    rel=$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$path" "$ROUTE_DIR_ABS") || continue
+    if [[ "$rel" == "." ]]; then
+      route='/'
+    else
+      route="/$rel"
+    fi
+    kind='exec'
+    printf '%s\t%s\t%s\t%s\n' "$route" "*" "$path" "$kind" >> "$ROUTE_TABLE"
+  done < <(find "$ROUTE_DIR_ABS" -type f | sort)
 }
 
 print_routes() {
@@ -309,13 +325,23 @@ find_handler_for_method() {
   local route="$1"
   local method="$2"
   local line r m handler kind
+  local implicit_handler="" implicit_kind=""
   while IFS=$'\t' read -r r m handler kind; do
     if [[ "$r" == "$route" && "$m" == "$method" ]]; then
       MATCH_HANDLER="$handler"
       MATCH_KIND="$kind"
       return 0
     fi
+    if [[ "$r" == "$route" && "$m" == "*" ]]; then
+      implicit_handler="$handler"
+      implicit_kind="$kind"
+    fi
   done < "$ROUTE_TABLE"
+  if [[ -n "$implicit_handler" ]]; then
+    MATCH_HANDLER="$implicit_handler"
+    MATCH_KIND="$implicit_kind"
+    return 0
+  fi
   return 1
 }
 

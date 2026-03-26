@@ -33,6 +33,7 @@ class Node {
     Node param
     String paramName = ""
     final Map<String, Path> handlers = new TreeMap<>()
+    Path implicitHandler = null
 
     Map match(List<String> segs) {
         Map<String, String> params = new LinkedHashMap<>()
@@ -125,26 +126,47 @@ Node buildTree(String routeDir, Set<String> methods) {
         @Override
         FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
             String method = file.fileName.toString().toUpperCase(Locale.ROOT)
-            if (!methods.contains(method)) {
-                return FileVisitResult.CONTINUE
-            }
-            Path relative = absDir.relativize(file.parent)
-            Node cur = root
-            for (Path segPath : relative) {
-                String seg = segPath.toString()
-                if (seg.startsWith(':')) {
-                    if (cur.param == null) {
-                        cur.param = new Node(paramName: seg.substring(1))
+            if (methods.contains(method)) {
+                Path relative = absDir.relativize(file.parent)
+                Node cur = root
+                for (Path segPath : relative) {
+                    String seg = segPath.toString()
+                    if (seg.startsWith(':')) {
+                        if (cur.param == null) {
+                            cur.param = new Node(paramName: seg.substring(1))
+                        }
+                        cur = cur.param
+                    } else {
+                        if (!cur.literal.containsKey(seg)) {
+                            cur.literal.put(seg, new Node())
+                        }
+                        cur = cur.literal.get(seg)
                     }
-                    cur = cur.param
-                } else {
-                    if (!cur.literal.containsKey(seg)) {
-                        cur.literal.put(seg, new Node())
-                    }
-                    cur = cur.literal.get(seg)
                 }
+                cur.handlers.put(method, file)
+            } else {
+                try {
+                    if (isExecutable(file)) {
+                        Path relative = absDir.relativize(file)
+                        Node cur = root
+                        for (Path segPath : relative) {
+                            String seg = segPath.toString()
+                            if (seg.startsWith(':')) {
+                                if (cur.param == null) {
+                                    cur.param = new Node(paramName: seg.substring(1))
+                                }
+                                cur = cur.param
+                            } else {
+                                if (!cur.literal.containsKey(seg)) {
+                                    cur.literal.put(seg, new Node())
+                                }
+                                cur = cur.literal.get(seg)
+                            }
+                        }
+                        cur.implicitHandler = file
+                    }
+                } catch (IOException ignored) {}
             }
-            cur.handlers.put(method, file)
             FileVisitResult.CONTINUE
         }
 
@@ -185,6 +207,9 @@ void collectRoutes(Node node, String prefix, List<RouteItem> items) {
             tag = 'unknown'
         }
         items << new RouteItem(route: route, method: method, path: path, tag: tag)
+    }
+    if (node.implicitHandler != null) {
+        items << new RouteItem(route: route, method: '*', path: node.implicitHandler, tag: 'exec')
     }
     node.literal.keySet().sort().each { String seg ->
         collectRoutes(node.literal.get(seg), joinPrefix(prefix, seg), items)
@@ -554,7 +579,7 @@ class RouterHandler implements HttpHandler {
             Map match = root.match(segs)
             Node node = (Node) match.node
             Map<String, String> params = (Map<String, String>) (match.params ?: [:])
-            if (node == null || node.handlers.isEmpty()) {
+            if (node == null || (node.handlers.isEmpty() && node.implicitHandler == null)) {
                 status = support.serveFilesystem(exchange, method, routeDir, segs, rawPath, timeoutSeconds, listenAddr)
                 support.logResult(method, rawPath, status, start)
                 return
@@ -563,6 +588,11 @@ class RouterHandler implements HttpHandler {
             Path handlerPath = node.handlers.get(method)
             if (handlerPath == null && method == 'HEAD') {
                 handlerPath = node.handlers.get('GET')
+            }
+            if (handlerPath == null && node.implicitHandler != null) {
+                status = support.handleHandler(exchange, method, node.implicitHandler, params, timeoutSeconds, listenAddr)
+                support.logResult(method, rawPath, status, start)
+                return
             }
             if (handlerPath == null) {
                 List<String> allowed = node.handlers.keySet().toList().sort()

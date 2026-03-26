@@ -38,6 +38,7 @@ struct Node {
     param: Option<Box<Node>>,
     param_name: String,
     handlers: BTreeMap<String, PathBuf>,
+    implicit_handler: Option<PathBuf>,
 }
 
 impl Node {
@@ -149,13 +150,22 @@ async fn handle_request(
         }
     };
 
-    if node.handlers.is_empty() {
+    if node.handlers.is_empty() && node.implicit_handler.is_none() {
         let response = serve_filesystem(&state, &parts, &body, remote_addr, &segs, &raw_path).await;
         log_request(method.as_str(), &raw_path, response.status(), start.elapsed());
         return response;
     }
 
-    let Some(handler_path) = node.handlers.get(method.as_str()).cloned() else {
+    // Try method handler
+    let handler_path = node.handlers.get(method.as_str()).cloned();
+
+    // If no method handler, try implicit
+    let handler_path = if let Some(path) = handler_path {
+        path
+    } else if let Some(ref implicit) = node.implicit_handler {
+        implicit.clone()
+    } else {
+        // Method handlers exist but none match this method
         let allowed: Vec<String> = node.handlers.keys().cloned().collect();
         let mut response = json_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -412,28 +422,47 @@ fn build_tree(route_dir: &Path) -> std::io::Result<Node> {
         }
 
         let method = entry.file_name().to_string_lossy().to_uppercase();
-        if !HTTP_METHODS.contains(&method.as_str()) {
-            continue;
-        }
+        if HTTP_METHODS.contains(&method.as_str()) {
+            let parent = entry.path().parent().unwrap_or(abs.as_path());
+            let rel = parent.strip_prefix(&abs).unwrap_or_else(|_| Path::new(""));
+            let segs = path_segments(rel);
 
-        let parent = entry.path().parent().unwrap_or(abs.as_path());
-        let rel = parent.strip_prefix(&abs).unwrap_or_else(|_| Path::new(""));
-        let segs = path_segments(rel);
-
-        let mut cur = &mut root;
-        for seg in segs {
-            if let Some(name) = seg.strip_prefix(':') {
-                let param = cur.param.get_or_insert_with(|| Box::new(Node::default()));
-                if param.param_name.is_empty() {
-                    param.param_name = name.to_string();
+            let mut cur = &mut root;
+            for seg in segs {
+                if let Some(name) = seg.strip_prefix(':') {
+                    let param = cur.param.get_or_insert_with(|| Box::new(Node::default()));
+                    if param.param_name.is_empty() {
+                        param.param_name = name.to_string();
+                    }
+                    cur = param.as_mut();
+                } else {
+                    cur = cur.literal.entry(seg).or_default();
                 }
-                cur = param.as_mut();
-            } else {
-                cur = cur.literal.entry(seg).or_default();
+            }
+
+            cur.handlers.insert(method, entry.path().to_path_buf());
+        } else {
+            // Check if executable
+            if let Ok(metadata) = fs::metadata(entry.path()) {
+                if is_executable(&metadata) {
+                    let rel = entry.path().strip_prefix(&abs).unwrap_or(Path::new(""));
+                    let segs = path_segments(rel);
+                    let mut cur = &mut root;
+                    for seg in segs {
+                        if let Some(name) = seg.strip_prefix(':') {
+                            let param = cur.param.get_or_insert_with(|| Box::new(Node::default()));
+                            if param.param_name.is_empty() {
+                                param.param_name = name.to_string();
+                            }
+                            cur = param.as_mut();
+                        } else {
+                            cur = cur.literal.entry(seg).or_default();
+                        }
+                    }
+                    cur.implicit_handler = Some(entry.path().to_path_buf());
+                }
             }
         }
-
-        cur.handlers.insert(method, entry.path().to_path_buf());
     }
 
     Ok(root)
@@ -622,6 +651,15 @@ fn collect_routes(node: &Node, prefix: String, routes: &mut Vec<(String, String,
         }
         .to_string();
         routes.push((method.clone(), route.clone(), path.clone(), tag));
+    }
+
+    if let Some(ref implicit) = node.implicit_handler {
+        let tag = match fs::metadata(implicit) {
+            Ok(metadata) if is_executable(&metadata) => "exec",
+            Ok(_) => "static",
+            Err(_) => "unknown",
+        }.to_string();
+        routes.push(("*".to_string(), route.clone(), implicit.clone(), tag));
     }
 
     for (segment, child) in &node.literal {

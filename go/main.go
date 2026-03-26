@@ -67,10 +67,11 @@ var httpMethods = map[string]bool{
 }
 
 type node struct {
-	literal   map[string]*node  // exact-match children
-	param     *node             // single wildcard child (:name)
-	paramName string            // name without leading colon
-	handlers  map[string]string // METHOD → absolute file path
+	literal         map[string]*node  // exact-match children
+	param           *node             // single wildcard child (:name)
+	paramName       string            // name without leading colon
+	handlers        map[string]string // METHOD → absolute file path
+	implicitHandler string            // path to implicit handler (executable non-method file)
 }
 
 func newNode() *node {
@@ -98,7 +99,7 @@ func (n *node) match(segs []string) (*node, map[string]string) {
 	return cur, params
 }
 
-// buildTree walks routeDir and registers every method file it finds.
+// buildTree walks routeDir and registers every method file and implicit handler it finds.
 func buildTree(root *node, routeDir string) error {
 	abs, err := filepath.Abs(routeDir)
 	if err != nil {
@@ -109,29 +110,47 @@ func buildTree(root *node, routeDir string) error {
 			return err
 		}
 		method := strings.ToUpper(info.Name())
-		if !httpMethods[method] {
-			return nil
-		}
+		if httpMethods[method] {
+			rel, _ := filepath.Rel(abs, filepath.Dir(path))
+			segs := splitSegments(filepath.ToSlash(rel))
 
-		rel, _ := filepath.Rel(abs, filepath.Dir(path))
-		segs := splitSegments(filepath.ToSlash(rel))
-
-		cur := root
-		for _, seg := range segs {
-			if strings.HasPrefix(seg, ":") {
-				if cur.param == nil {
-					cur.param = newNode()
-					cur.param.paramName = seg[1:]
+			cur := root
+			for _, seg := range segs {
+				if strings.HasPrefix(seg, ":") {
+					if cur.param == nil {
+						cur.param = newNode()
+						cur.param.paramName = seg[1:]
+					}
+					cur = cur.param
+				} else {
+					if _, ok := cur.literal[seg]; !ok {
+						cur.literal[seg] = newNode()
+					}
+					cur = cur.literal[seg]
 				}
-				cur = cur.param
-			} else {
-				if _, ok := cur.literal[seg]; !ok {
-					cur.literal[seg] = newNode()
-				}
-				cur = cur.literal[seg]
 			}
+			cur.handlers[method] = path
+		} else if info.Mode()&0111 != 0 {
+			rel, _ := filepath.Rel(abs, path)
+			segs := splitSegments(filepath.ToSlash(rel))
+
+			cur := root
+			for _, seg := range segs {
+				if strings.HasPrefix(seg, ":") {
+					if cur.param == nil {
+						cur.param = newNode()
+						cur.param.paramName = seg[1:]
+					}
+					cur = cur.param
+				} else {
+					if _, ok := cur.literal[seg]; !ok {
+						cur.literal[seg] = newNode()
+					}
+					cur = cur.literal[seg]
+				}
+			}
+			cur.implicitHandler = path
 		}
-		cur.handlers[method] = path
 		return nil
 	})
 }
@@ -156,6 +175,13 @@ func printRoutes(n *node, prefix string) {
 			route = "/"
 		}
 		log.Printf("  %-7s %-45s → %s [%s]", method, route, path, tag)
+	}
+	if n.implicitHandler != "" {
+		route := "/" + prefix
+		if route == "//" {
+			route = "/"
+		}
+		log.Printf("  %-7s %-45s → %s [%s]", "*", route, n.implicitHandler, "exec")
 	}
 	keys := make([]string, 0, len(n.literal))
 	for k := range n.literal {
@@ -192,24 +218,30 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	segs := splitSegments(r.URL.Path)
 
 	nd, params := s.root.match(segs)
-	if nd == nil || len(nd.handlers) == 0 {
+	if nd == nil || (len(nd.handlers) == 0 && nd.implicitHandler == "") {
 		status := s.serveFilesystem(w, r, segs)
 		log.Printf("%s %s → %d (%v)", r.Method, r.URL.Path, status, time.Since(start))
 		return
 	}
 
 	handlerPath, ok := nd.handlers[r.Method]
-	if !ok {
-		allowed := sortedKeys(nd.handlers)
-		w.Header().Set("Allow", strings.Join(allowed, ", "))
-		writeJSON(w, 405, `{"error":"method_not_allowed","allow":[%s]}`,
-			`"`+strings.Join(allowed, `","`)+`"`)
-		log.Printf("%s %s → 405 (%v)", r.Method, r.URL.Path, time.Since(start))
+	if ok {
+		status := s.handle(w, r, handlerPath, params)
+		log.Printf("%s %s → %d (%v)", r.Method, r.URL.Path, status, time.Since(start))
 		return
 	}
 
-	status := s.handle(w, r, handlerPath, params)
-	log.Printf("%s %s → %d (%v)", r.Method, r.URL.Path, status, time.Since(start))
+	if nd.implicitHandler != "" {
+		status := s.handle(w, r, nd.implicitHandler, params)
+		log.Printf("%s %s → %d (%v)", r.Method, r.URL.Path, status, time.Since(start))
+		return
+	}
+
+	allowed := sortedKeys(nd.handlers)
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	writeJSON(w, 405, `{"error":"method_not_allowed","allow":[%s]}`,
+		`"`+strings.Join(allowed, `","`)+`"`)
+	log.Printf("%s %s → 405 (%v)", r.Method, r.URL.Path, time.Since(start))
 }
 
 func (s *server) serveFilesystem(w http.ResponseWriter, r *http.Request, segs []string) int {

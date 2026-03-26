@@ -174,6 +174,7 @@ local function new_node(param_name)
     param = nil,
     param_name = param_name or "",
     handlers = {},
+    implicit_handler = nil,
   }
 end
 
@@ -204,6 +205,28 @@ local function build_tree(route_dir)
         end
       end
       cur.handlers[method] = file_path
+    elseif is_executable(file_path) then
+      local rel = file_path:sub(#route_dir + 1)
+      rel = rel:gsub("^" .. path_sep .. "+", "")
+      local cur = root
+      if rel ~= "" and rel ~= "." then
+        for seg in rel:gmatch("[^" .. path_sep .. "]+") do
+          if seg:sub(1, 1) == ":" then
+            if not cur.param then
+              cur.param = new_node(seg:sub(2))
+            end
+            cur = cur.param
+          else
+            if not cur.literal[seg] then
+              cur.literal[seg] = new_node()
+              cur.literal_order[#cur.literal_order + 1] = seg
+              table.sort(cur.literal_order)
+            end
+            cur = cur.literal[seg]
+          end
+        end
+      end
+      cur.implicit_handler = file_path
     end
   end
   return root
@@ -237,6 +260,10 @@ local function collect_routes(node, prefix, items)
   for method, file_path in pairs(node.handlers) do
     local tag = is_executable(file_path) and "exec" or "static"
     items[#items + 1] = { route = route, method = method, path = file_path, tag = tag }
+  end
+  if node.implicit_handler then
+    local tag = is_executable(node.implicit_handler) and "exec" or "static"
+    items[#items + 1] = { route = route, method = "*", path = node.implicit_handler, tag = tag }
   end
   table.sort(node.literal_order)
   for _, seg in ipairs(node.literal_order) do
@@ -690,13 +717,17 @@ local function main()
         local ok_handle, handle_err = pcall(function()
           local segs = normalize_request_path(request.path)
           local node, params = match_node(root, segs)
-          if not node or next(node.handlers) == nil then
+          if not node or (next(node.handlers) == nil and not node.implicit_handler) then
             status = serve_filesystem_fallback(client, request, segs, abs_route_dir, timeout_seconds, listen_addr)
             return
           end
           local handler_path = node.handlers[request.method]
           if not handler_path and request.method == "HEAD" then
             handler_path = node.handlers.GET
+          end
+          if not handler_path and node.implicit_handler then
+            status = handle_handler(client, request, node.implicit_handler, params or {}, timeout_seconds, listen_addr)
+            return
           end
           if not handler_path then
             local allow = {}

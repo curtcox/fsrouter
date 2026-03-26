@@ -10,6 +10,7 @@ class Node {
   param: Node | null = null;
   paramName = "";
   handlers = new Map<string, string>();
+  implicitHandler: string | null = null;
 
   match(segs: string[]): MatchResult {
     const params: Record<string, string> = {};
@@ -100,31 +101,52 @@ async function walkRouteDir(baseDir: string, currentDir: string, root: Node): Pr
       continue;
     }
     const method = entry.name.toUpperCase();
-    if (!HTTP_METHODS.has(method)) {
-      continue;
-    }
-    const parent = currentDir;
-    const relativeParent = parent === baseDir ? "" : parent.slice(baseDir.length + 1);
-    let cur = root;
-    if (relativeParent) {
-      for (const seg of relativeParent.split("/")) {
-        if (seg.startsWith(":")) {
-          if (!cur.param) {
-            cur.param = new Node();
-            cur.param.paramName = seg.slice(1);
+    if (HTTP_METHODS.has(method)) {
+      const parent = currentDir;
+      const relativeParent = parent === baseDir ? "" : parent.slice(baseDir.length + 1);
+      let cur = root;
+      if (relativeParent) {
+        for (const seg of relativeParent.split("/")) {
+          if (seg.startsWith(":")) {
+            if (!cur.param) {
+              cur.param = new Node();
+              cur.param.paramName = seg.slice(1);
+            }
+            cur = cur.param;
+          } else {
+            let next = cur.literal.get(seg);
+            if (!next) {
+              next = new Node();
+              cur.literal.set(seg, next);
+            }
+            cur = next;
           }
-          cur = cur.param;
-        } else {
-          let next = cur.literal.get(seg);
-          if (!next) {
-            next = new Node();
-            cur.literal.set(seg, next);
-          }
-          cur = next;
         }
       }
+      cur.handlers.set(method, fullPath);
+    } else if (await isExecutable(fullPath).catch(() => false)) {
+      const relativePath = fullPath === baseDir ? "" : fullPath.slice(baseDir.length + 1);
+      let cur = root;
+      if (relativePath) {
+        for (const seg of relativePath.split("/")) {
+          if (seg.startsWith(":")) {
+            if (!cur.param) {
+              cur.param = new Node();
+              cur.param.paramName = seg.slice(1);
+            }
+            cur = cur.param;
+          } else {
+            let next = cur.literal.get(seg);
+            if (!next) {
+              next = new Node();
+              cur.literal.set(seg, next);
+            }
+            cur = next;
+          }
+        }
+      }
+      cur.implicitHandler = fullPath;
     }
-    cur.handlers.set(method, fullPath);
   }
 }
 
@@ -146,6 +168,9 @@ async function collectRoutes(node: Node, prefix: string, items: RouteItem[]): Pr
       tag = "unknown";
     }
     items.push({ route, method, path, tag });
+  }
+  if (node.implicitHandler !== null) {
+    items.push({ route, method: "*", path: node.implicitHandler, tag: "exec" });
   }
   for (const seg of [...node.literal.keys()].sort()) {
     await collectRoutes(node.literal.get(seg)!, joinRoute(prefix, seg), items);
@@ -485,7 +510,7 @@ async function handleRequest(request: Request, root: Node, timeoutSeconds: numbe
   try {
     const segs = normalizeRequestPath(url.pathname);
     const match = root.match(segs);
-    if (!match.node || match.node.handlers.size === 0) {
+    if (!match.node || (match.node.handlers.size === 0 && match.node.implicitHandler === null)) {
       response = await serveFilesystem(routeDir, segs, url.pathname, request, timeoutSeconds, listenAddr, remoteAddr);
       logResult(request, response.status, start);
       return response;
@@ -495,13 +520,24 @@ async function handleRequest(request: Request, root: Node, timeoutSeconds: numbe
     if (!handlerPath && request.method === "HEAD") {
       handlerPath = match.node.handlers.get("GET") ?? null;
     }
+
+    if (!handlerPath && match.node.implicitHandler !== null) {
+      handlerPath = match.node.implicitHandler;
+    }
+
     if (!handlerPath) {
-      const allowed = [...match.node.handlers.keys()].sort();
-      response = jsonResponse(405, { error: "method_not_allowed", allow: allowed }, request.method, {
-        allow: allowed.join(", "),
-      });
-      logResult(request, response.status, start);
-      return response;
+      if (match.node.handlers.size > 0) {
+        const allowed = [...match.node.handlers.keys()].sort();
+        response = jsonResponse(405, { error: "method_not_allowed", allow: allowed }, request.method, {
+          allow: allowed.join(", "),
+        });
+        logResult(request, response.status, start);
+        return response;
+      } else {
+        response = await serveFilesystem(routeDir, segs, url.pathname, request, timeoutSeconds, listenAddr, remoteAddr);
+        logResult(request, response.status, start);
+        return response;
+      }
     }
 
     try {

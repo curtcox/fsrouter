@@ -9,13 +9,14 @@ require 'webrick'
 HTTP_METHODS = %w[GET HEAD POST PUT DELETE PATCH OPTIONS].freeze
 
 class Node
-  attr_accessor :literal, :param, :param_name, :handlers
+  attr_accessor :literal, :param, :param_name, :handlers, :implicit_handler
 
   def initialize(param_name = '')
     @literal = {}
     @param = nil
     @param_name = param_name
     @handlers = {}
+    @implicit_handler = nil
   end
 
   def match(segs)
@@ -65,21 +66,34 @@ def build_tree(route_dir)
     next if File.directory?(path)
 
     method = File.basename(path).upcase
-    next unless HTTP_METHODS.include?(method)
-
-    rel_dir = File.dirname(path).delete_prefix(abs_dir)
-    segs = rel_dir.split('/').reject(&:empty?)
-    cur = root
-    segs.each do |seg|
-      if seg.start_with?(':')
-        cur.param ||= Node.new(seg[1..-1])
-        cur = cur.param
-      else
-        cur.literal[seg] ||= Node.new
-        cur = cur.literal[seg]
+    if HTTP_METHODS.include?(method)
+      rel_dir = File.dirname(path).delete_prefix(abs_dir)
+      segs = rel_dir.split('/').reject(&:empty?)
+      cur = root
+      segs.each do |seg|
+        if seg.start_with?(':')
+          cur.param ||= Node.new(seg[1..-1])
+          cur = cur.param
+        else
+          cur.literal[seg] ||= Node.new
+          cur = cur.literal[seg]
+        end
       end
+      cur.handlers[method] = path
+    elsif is_executable(path)
+      rel = path.delete_prefix(abs_dir).split('/').reject(&:empty?)
+      cur = root
+      rel.each do |seg|
+        if seg.start_with?(':')
+          cur.param ||= Node.new(seg[1..-1])
+          cur = cur.param
+        else
+          cur.literal[seg] ||= Node.new
+          cur = cur.literal[seg]
+        end
+      end
+      cur.implicit_handler = path
     end
-    cur.handlers[method] = path
   end
 
   root
@@ -94,6 +108,9 @@ def collect_routes(node, prefix, items)
       'unknown'
     end
     items << [route, method, path, tag]
+  end
+  if node.implicit_handler
+    items << [route, '*', node.implicit_handler, 'exec']
   end
   node.literal.keys.sort.each do |seg|
     collect_routes(node.literal[seg], join_prefix(prefix, seg), items)
@@ -359,12 +376,14 @@ def process_request(req, res, root, server_config)
   begin
     segs = normalize_request_path(req.path)
     node, params = root.match(segs)
-    if node.nil? || node.handlers.empty?
+    if node.nil? || (node.handlers.empty? && node.implicit_handler.nil?)
       status = serve_filesystem_fallback(req, res, segs, server_config[:route_dir_abs], server_config)
     else
       handler_path = node.handlers[req.request_method]
       handler_path ||= node.handlers['GET'] if req.request_method == 'HEAD'
-      if handler_path.nil?
+      if handler_path.nil? && node.implicit_handler
+        status = handle_handler(req, res, server_config, node.implicit_handler, params || {})
+      elsif handler_path.nil?
         allowed = node.handlers.keys.sort
         json_response(res, req, 405, { error: 'method_not_allowed', allow: allowed })
         res['Allow'] = allowed.join(', ')

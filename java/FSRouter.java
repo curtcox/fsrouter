@@ -47,6 +47,7 @@ public class FSRouter {
         Node param;
         String paramName = "";
         final Map<String, Path> handlers = new TreeMap<>();
+        Path implicitHandler;
 
         MatchResult match(List<String> segs) {
             Map<String, String> params = new LinkedHashMap<>();
@@ -128,7 +129,7 @@ public class FSRouter {
             try {
                 List<String> segs = normalizeRequestPath(rawPath);
                 MatchResult match = root.match(segs);
-                if (match.node() == null || match.node().handlers.isEmpty()) {
+                if (match.node() == null || (match.node().handlers.isEmpty() && match.node().implicitHandler == null)) {
                     status = serveFilesystem(exchange, method, routeDir, segs, rawPath, timeoutSeconds, listenAddr);
                     logResult(method, rawPath, status, start);
                     return;
@@ -137,6 +138,11 @@ public class FSRouter {
                 Path handlerPath = match.node().handlers.get(method);
                 if (handlerPath == null && method.equals("HEAD")) {
                     handlerPath = match.node().handlers.get("GET");
+                }
+                if (handlerPath == null && match.node().implicitHandler != null) {
+                    status = handleHandler(exchange, method, match.node().implicitHandler, match.params() == null ? Map.of() : match.params(), timeoutSeconds, listenAddr);
+                    logResult(method, rawPath, status, start);
+                    return;
                 }
                 if (handlerPath == null) {
                     List<String> allowed = new ArrayList<>(match.node().handlers.keySet());
@@ -399,25 +405,45 @@ public class FSRouter {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                 String method = file.getFileName().toString().toUpperCase(Locale.ROOT);
-                if (!HTTP_METHODS.contains(method)) {
-                    return FileVisitResult.CONTINUE;
-                }
-                Path relative = absDir.relativize(file.getParent());
-                Node cur = root;
-                for (Path segPath : relative) {
-                    String seg = segPath.toString();
-                    if (seg.startsWith(":")) {
-                        if (cur.param == null) {
-                            cur.param = new Node();
-                            cur.param.paramName = seg.substring(1);
+                if (HTTP_METHODS.contains(method)) {
+                    Path relative = absDir.relativize(file.getParent());
+                    Node cur = root;
+                    for (Path segPath : relative) {
+                        String seg = segPath.toString();
+                        if (seg.startsWith(":")) {
+                            if (cur.param == null) {
+                                cur.param = new Node();
+                                cur.param.paramName = seg.substring(1);
+                            }
+                            cur = cur.param;
+                        } else {
+                            cur.literal.putIfAbsent(seg, new Node());
+                            cur = cur.literal.get(seg);
                         }
-                        cur = cur.param;
-                    } else {
-                        cur.literal.putIfAbsent(seg, new Node());
-                        cur = cur.literal.get(seg);
                     }
+                    cur.handlers.put(method, file);
+                } else {
+                    try {
+                        if (isExecutable(file)) {
+                            Path relative = absDir.relativize(file);
+                            Node cur = root;
+                            for (Path segPath : relative) {
+                                String seg = segPath.toString();
+                                if (seg.startsWith(":")) {
+                                    if (cur.param == null) {
+                                        cur.param = new Node();
+                                        cur.param.paramName = seg.substring(1);
+                                    }
+                                    cur = cur.param;
+                                } else {
+                                    cur.literal.putIfAbsent(seg, new Node());
+                                    cur = cur.literal.get(seg);
+                                }
+                            }
+                            cur.implicitHandler = file;
+                        }
+                    } catch (IOException ignored) {}
                 }
-                cur.handlers.put(method, file);
                 return FileVisitResult.CONTINUE;
             }
 
@@ -445,6 +471,15 @@ public class FSRouter {
                 tag = "unknown";
             }
             items.add(new RouteItem(route, entry.getKey(), entry.getValue(), tag));
+        }
+        if (node.implicitHandler != null) {
+            String tag;
+            try {
+                tag = isExecutable(node.implicitHandler) ? "exec" : "static";
+            } catch (IOException e) {
+                tag = "unknown";
+            }
+            items.add(new RouteItem(route, "*", node.implicitHandler, tag));
         }
         for (String seg : node.literal.keySet()) {
             collectRoutes(node.literal.get(seg), joinPrefix(prefix, seg), items);

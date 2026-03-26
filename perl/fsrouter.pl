@@ -68,6 +68,7 @@ sub new_node {
         param => undef,
         param_name => defined($param_name) ? $param_name : '',
         handlers => {},
+        implicit_handler => undef,
     };
 }
 
@@ -86,26 +87,43 @@ sub build_tree {
                 my $full = $File::Find::name;
                 my ($filename) = $full =~ m{([^/]+)$};
                 my $method = uc($filename // '');
-                return if !$HTTP_METHODS{$method};
 
-                my $parent = $full;
-                $parent =~ s{[^/]+$}{};
-                $parent =~ s{/$}{};
-                my $rel = File::Spec->abs2rel($parent, $abs_dir);
-                my @parts = grep { $_ ne '' && $_ ne '.' } File::Spec->splitdir($rel);
-                my $cur = $root;
-                for my $seg (@parts) {
-                    if ($seg =~ /^:(.+)$/) {
-                        if (!defined $cur->{param}) {
-                            $cur->{param} = new_node($1);
+                if ($HTTP_METHODS{$method}) {
+                    my $parent = $full;
+                    $parent =~ s{[^/]+$}{};
+                    $parent =~ s{/$}{};
+                    my $rel = File::Spec->abs2rel($parent, $abs_dir);
+                    my @parts = grep { $_ ne '' && $_ ne '.' } File::Spec->splitdir($rel);
+                    my $cur = $root;
+                    for my $seg (@parts) {
+                        if ($seg =~ /^:(.+)$/) {
+                            if (!defined $cur->{param}) {
+                                $cur->{param} = new_node($1);
+                            }
+                            $cur = $cur->{param};
+                        } else {
+                            $cur->{literal}{$seg} ||= new_node();
+                            $cur = $cur->{literal}{$seg};
                         }
-                        $cur = $cur->{param};
-                    } else {
-                        $cur->{literal}{$seg} ||= new_node();
-                        $cur = $cur->{literal}{$seg};
                     }
+                    $cur->{handlers}{$method} = $full;
+                } elsif (is_executable($full)) {
+                    my $rel = File::Spec->abs2rel($full, $abs_dir);
+                    my @parts = grep { $_ ne '' && $_ ne '.' } File::Spec->splitdir($rel);
+                    my $cur = $root;
+                    for my $seg (@parts) {
+                        if ($seg =~ /^:(.+)$/) {
+                            if (!defined $cur->{param}) {
+                                $cur->{param} = new_node($1);
+                            }
+                            $cur = $cur->{param};
+                        } else {
+                            $cur->{literal}{$seg} ||= new_node();
+                            $cur = $cur->{literal}{$seg};
+                        }
+                    }
+                    $cur->{implicit_handler} = $full;
                 }
-                $cur->{handlers}{$method} = $full;
             },
         },
         $abs_dir,
@@ -149,6 +167,9 @@ sub collect_routes {
         my $path = $node->{handlers}{$method};
         my $tag = eval { is_executable($path) ? 'exec' : 'static' } || 'unknown';
         push @{$items}, [$route, $method, $path, $tag];
+    }
+    if (defined $node->{implicit_handler}) {
+        push @{$items}, [$route, '*', $node->{implicit_handler}, 'exec'];
     }
     for my $seg (sort keys %{ $node->{literal} }) {
         collect_routes($node->{literal}{$seg}, join_prefix($prefix, $seg), $items);
@@ -621,7 +642,7 @@ sub main {
         eval {
             my $segs = normalize_request_path($request->{path});
             my ($node, $params) = match_node($root, $segs);
-            if (!defined $node || !keys %{ $node->{handlers} }) {
+            if (!defined $node || (!keys %{ $node->{handlers} } && !defined $node->{implicit_handler})) {
                 $status = serve_filesystem_fallback($client, $request, $segs, $abs_route_dir, $timeout_seconds, $listen_addr);
                 1;
             } else {
@@ -629,7 +650,10 @@ sub main {
                 if (!defined $handler_path && $request->{method} eq 'HEAD') {
                     $handler_path = $node->{handlers}{GET};
                 }
-                if (!defined $handler_path) {
+                if (!defined $handler_path && defined $node->{implicit_handler}) {
+                    $status = handle_handler($client, $request, $node->{implicit_handler}, $params || {}, $timeout_seconds, $listen_addr);
+                    1;
+                } elsif (!defined $handler_path) {
                     my @allow = sort keys %{ $node->{handlers} };
                     $status = write_json($client, $request->{method}, 405, { error => 'method_not_allowed', allow => \@allow }, { Allow => join(', ', @allow) });
                     1;
