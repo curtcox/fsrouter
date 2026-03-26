@@ -197,7 +197,7 @@ def _handle_commands(
                 results.append(
                     {
                         "command": command_item["command"],
-                        "status": "blocked",
+                        "status": "rejected" if verdict == "rejected" else "blocked",
                         "reason": reasoning or f"Command blocked by cached verdict: {verdict}",
                     }
                 )
@@ -552,7 +552,12 @@ def _command_result_payload(command, execution):
 
 def _normalize_user_decision(answer):
     if isinstance(answer, dict):
-        value = answer.get("choice") or answer.get("option") or answer.get("text") or ""
+        parts = [
+            str(answer.get("choice") or ""),
+            str(answer.get("option") or ""),
+            str(answer.get("text") or ""),
+        ]
+        value = " ".join(part for part in parts if part)
     else:
         value = str(answer)
     lowered = value.strip().lower()

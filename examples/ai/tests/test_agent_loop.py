@@ -30,6 +30,10 @@ class FakeClient:
         return response
 
 
+class RetryableError(Exception):
+    pass
+
+
 class AgentLoopTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -344,6 +348,733 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertEqual("error", result["type"])
         self.assertIn("Missing template variable", result["error"])
+
+    def test_feedback_is_logged_and_sent_after_system_message(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                )
+            ]
+        )
+        budget = BudgetRef(remaining=2)
+        feedback = [{"kind": "review_rejection", "message": "avoid shell pipes"}]
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            feedback=feedback,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        logged_feedback = json.loads((self.log_dir / "feedback.json").read_text(encoding="utf-8"))
+        request_log = json.loads((self.log_dir / "request.json").read_text(encoding="utf-8"))
+        self.assertEqual(feedback, logged_feedback)
+        self.assertEqual("system", request_log[0]["messages"][0]["role"])
+        self.assertEqual("user", request_log[0]["messages"][1]["role"])
+        self.assertIn("avoid shell pipes", request_log[0]["messages"][1]["content"])
+
+    def test_cache_hit_rejected_returns_rejected_status_without_review_call(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "rm note.txt", "purpose": "cleanup"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "handled"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        (self.data_dir / "safety-cache.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "pattern": "rm *",
+                        "verdict": "rejected",
+                        "source": "user",
+                        "reasoning": "destructive",
+                        "timestamp": "2026-03-26T12:00:00Z",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        budget = BudgetRef(remaining=3)
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual(2, len(client.requests))
+        conversation = json.loads((self.log_dir / "conversation.json").read_text(encoding="utf-8"))
+        command_results = json.loads(conversation[2]["content"])
+        self.assertEqual("rejected", command_results["results"][0]["status"])
+
+    def test_review_invalid_json_retries_and_spends_budget_twice(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "echo hello", "purpose": "test"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response("not json"),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "echo *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=6)
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        requests = json.loads((self.log_dir / "request.json").read_text(encoding="utf-8"))
+        self.assertEqual(4, len(requests))
+        self.assertEqual(2, budget.remaining)
+
+    def test_primary_api_retries_do_not_consume_extra_budget(self):
+        client = FakeClient(
+            [
+                RetryableError("HTTP 500"),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=2)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual({"summary": "done"}, result)
+        self.assertEqual(1, budget.remaining)
+        self.assertEqual(2, len(client.requests))
+
+    def test_corrupt_cache_is_replaced_with_valid_json_after_review(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "echo hello", "purpose": "test"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "echo *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        (self.data_dir / "safety-cache.json").write_text("{not json", encoding="utf-8")
+        budget = BudgetRef(remaining=5)
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        repaired_cache = json.loads((self.data_dir / "safety-cache.json").read_text(encoding="utf-8"))
+        self.assertEqual("echo *", repaired_cache[0]["pattern"])
+
+    def test_three_consecutive_validation_failures_return_error(self):
+        client = FakeClient(
+            [
+                make_response("not json"),
+                make_response('{"type":"wat"}'),
+                make_response('{"type":"answer","answer":{"wrong":"shape"}}'),
+            ]
+        )
+        budget = BudgetRef(remaining=5)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual("error", result["type"])
+        self.assertIn("3 consecutive validation failures", result["error"])
+        requests = json.loads((self.log_dir / "request.json").read_text(encoding="utf-8"))
+        responses = json.loads((self.log_dir / "response.json").read_text(encoding="utf-8"))
+        self.assertEqual(3, len(requests))
+        self.assertEqual(3, len(responses))
+
+    def test_validation_failure_counter_resets_after_valid_command_turn(self):
+        client = FakeClient(
+            [
+                make_response("not json"),
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "echo hello", "purpose": "test"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "echo *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response("not json"),
+                make_response("still not json"),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=8)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual({"summary": "done"}, result)
+
+    def test_budget_zero_before_first_call_returns_budget_exhausted_without_request_logs(self):
+        client = FakeClient([])
+        budget = BudgetRef(remaining=0)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual("budget_exhausted", result["type"])
+        self.assertFalse((self.log_dir / "request.json").exists())
+        self.assertFalse((self.log_dir / "response.json").exists())
+
+    def test_budget_exhaustion_during_review_stops_before_command_runs(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "echo hello", "purpose": "test"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "echo *"},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=2)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual("budget_exhausted", result["type"])
+        commands = json.loads((self.log_dir / "commands.json").read_text(encoding="utf-8"))
+        self.assertIsNone(commands[0]["execution"])
+
+    def test_user_abort_from_other_text_returns_user_aborted(self):
+        def ask_user(question, options):
+            return {"choice": "Other", "text": "stop everything"}
+
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "rm note.txt", "purpose": "cleanup"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "risky", "reasoning": "destructive", "pattern": "rm *"},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=4)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=ask_user,
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual("user_aborted", result["type"])
+
+    def test_missing_prompt_file_returns_error(self):
+        client = FakeClient([])
+        budget = BudgetRef(remaining=1)
+
+        result = run_agent_loop(
+            goal="missing",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual("error", result["type"])
+        self.assertIn("Prompt template not found", result["error"])
+
+    def test_cache_pattern_wildcard_matching(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [
+                                {"command": "grep -r foo src", "purpose": "search"},
+                                {"command": "grep -r bar lib", "purpose": "search"},
+                                {"command": "grep baz file.txt", "purpose": "search"},
+                            ],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "grep *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        (self.data_dir / "safety-cache.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "pattern": "grep -r *",
+                        "verdict": "safe",
+                        "source": "review_model",
+                        "reasoning": "harmless",
+                        "timestamp": "2026-03-26T12:00:00Z",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        budget = BudgetRef(remaining=4)
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual(3, len(client.requests))
+        commands = json.loads((self.log_dir / "commands.json").read_text(encoding="utf-8"))
+        self.assertEqual("cache", commands[0]["safety"]["source"])
+        self.assertEqual("cache", commands[1]["safety"]["source"])
+        self.assertEqual("review", commands[2]["safety"]["source"])
+
+    def test_empty_commands_array_round_trips_without_crashing(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {"type": "command", "commands": [], "reasoning": "nothing to run"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=3)
+
+        result = run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        self.assertEqual({"summary": "done"}, result)
+        conversation = json.loads((self.log_dir / "conversation.json").read_text(encoding="utf-8"))
+        command_results = json.loads(conversation[2]["content"])
+        self.assertEqual([], command_results["results"])
+
+    def test_command_timeout_is_logged_and_returned(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "python3 -c \"import time; time.sleep(0.2)\"", "purpose": "wait"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "python3 -c *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=5)
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+            command_timeout=0.05,
+        )
+
+        commands = json.loads((self.log_dir / "commands.json").read_text(encoding="utf-8"))
+        self.assertTrue(commands[0]["execution"]["timed_out"])
+
+    def test_binary_output_is_base64_logged(self):
+        client = FakeClient(
+            [
+                make_response(
+                    json.dumps(
+                        {
+                            "type": "command",
+                            "commands": [{"command": "python3 -c \"import sys; sys.stdout.buffer.write(b'\\x00\\x01A')\"", "purpose": "binary"}],
+                            "reasoning": "inspect",
+                        },
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"verdict": "safe", "reasoning": "harmless", "pattern": "python3 -c *"},
+                        separators=(",", ":"),
+                    )
+                ),
+                make_response(
+                    json.dumps(
+                        {"type": "answer", "answer": {"summary": "done"}},
+                        separators=(",", ":"),
+                    )
+                ),
+            ]
+        )
+        budget = BudgetRef(remaining=5)
+
+        run_agent_loop(
+            goal="plan",
+            template_vars={"change_description": "add feature", "context": "none"},
+            output_schema={
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            model="primary",
+            review_model="review",
+            budget=budget,
+            log_dir=self.log_dir,
+            working_dir=self.working_dir,
+            ask_user=lambda question, options: "Approve",
+            prompts_dir=self.prompts_dir,
+            data_dir=self.data_dir,
+            client=client,
+            sleep_fn=lambda seconds: None,
+        )
+
+        commands = json.loads((self.log_dir / "commands.json").read_text(encoding="utf-8"))
+        self.assertEqual("AAFB", commands[0]["execution"]["stdout_base64"])
 
 
 if __name__ == "__main__":
