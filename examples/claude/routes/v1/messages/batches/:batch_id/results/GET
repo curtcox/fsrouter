@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""
+GET /v1/messages/batches/:batch_id/results — Get batch results.
+If the batch hasn't been processed yet, processes it synchronously.
+"""
+import sys
+import os
+import json
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "lib"))
+from claude_bridge import (
+    respond, error_response,
+    call_claude, format_anthropic_response,
+)
+
+BATCH_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "data", "batches")
+
+
+def main():
+    batch_id = os.environ.get("PARAM_BATCH_ID", "")
+    batch_path = os.path.join(BATCH_DIR, f"{batch_id}.json")
+    results_path = os.path.join(BATCH_DIR, f"{batch_id}-results.json")
+
+    if not os.path.isfile(batch_path):
+        error_response("not_found_error", f"Batch '{batch_id}' not found", 400)
+
+    # Check if results already exist
+    if os.path.isfile(results_path):
+        with open(results_path) as f:
+            results = json.load(f)
+        respond(results)
+
+    # Load batch and process
+    with open(batch_path) as f:
+        batch = json.load(f)
+
+    if batch["processing_status"] == "canceled":
+        error_response("invalid_request_error", "Batch was canceled")
+
+    requests = batch.get("requests", [])
+    results = []
+    succeeded = 0
+    errored = 0
+
+    for req in requests:
+        custom_id = req.get("custom_id", "unknown")
+        params = req.get("params", {})
+
+        try:
+            claude_result = call_claude(
+                messages=params.get("messages", []),
+                model=params.get("model", "claude-sonnet-4-6"),
+                system=params.get("system"),
+                max_tokens=params.get("max_tokens", 4096),
+                timeout=120,
+            )
+
+            if "error" in claude_result:
+                results.append({
+                    "custom_id": custom_id,
+                    "result": {
+                        "type": "errored",
+                        "error": {
+                            "type": "api_error",
+                            "message": claude_result["error"],
+                        }
+                    }
+                })
+                errored += 1
+            else:
+                response = format_anthropic_response(claude_result, params.get("model", "claude-sonnet-4-6"))
+                results.append({
+                    "custom_id": custom_id,
+                    "result": {
+                        "type": "succeeded",
+                        "message": response,
+                    }
+                })
+                succeeded += 1
+        except Exception as e:
+            results.append({
+                "custom_id": custom_id,
+                "result": {
+                    "type": "errored",
+                    "error": {
+                        "type": "api_error",
+                        "message": str(e),
+                    }
+                }
+            })
+            errored += 1
+
+    # Update batch status
+    batch["processing_status"] = "ended"
+    batch["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    batch["request_counts"]["processing"] = 0
+    batch["request_counts"]["succeeded"] = succeeded
+    batch["request_counts"]["errored"] = errored
+
+    with open(batch_path, "w") as f:
+        json.dump(batch, f, indent=2)
+
+    # Save results
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    respond(results)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""
+GET /v1/models/:model_id — Get a specific model's details.
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response, MODEL_CATALOG
+
+
+def main():
+    model_id = os.environ.get("PARAM_MODEL_ID", "")
+
+    for model in MODEL_CATALOG:
+        if model["id"] == model_id:
+            respond(model)
+
+    error_response("not_found_error", f"Model '{model_id}' not found", 400)
+
+
+if __name__ == "__main__":
+    main()

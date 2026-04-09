@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""
+POST /v1/messages/count_tokens — Token counting endpoint.
+Estimates token count for a messages payload.
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response, build_prompt_from_messages
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimation: ~4 chars per token for English text."""
+    return max(1, len(text) // 4)
+
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON body: {e}")
+
+    messages = body.get("messages")
+    if not messages:
+        error_response("invalid_request_error", "messages: field required")
+
+    system = body.get("system")
+    tools = body.get("tools", [])
+
+    # Build the full prompt to estimate total tokens
+    prompt_text = build_prompt_from_messages(messages, system)
+
+    # Add tool definitions to the token count
+    if tools:
+        import json
+        prompt_text += "\n" + json.dumps(tools)
+
+    input_tokens = estimate_tokens(prompt_text)
+
+    respond({
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    })
+
+
+if __name__ == "__main__":
+    main()

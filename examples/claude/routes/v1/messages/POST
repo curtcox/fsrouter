@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+POST /v1/messages — Anthropic Messages API compatible endpoint.
+Calls the `claude` CLI under the hood. No authorization required.
+"""
+import sys
+import os
+
+# Add lib to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import (
+    read_request_body, respond, error_response,
+    call_claude, format_anthropic_response,
+)
+
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON body: {e}")
+
+    # Validate required fields
+    messages = body.get("messages")
+    if not messages:
+        error_response("invalid_request_error", "messages: field required")
+
+    model = body.get("model", "claude-sonnet-4-6")
+    max_tokens = body.get("max_tokens", 4096)
+    system = body.get("system")
+    temperature = body.get("temperature")
+    stream = body.get("stream", False)
+
+    if stream:
+        # Streaming not supported through fsrouter subprocess model
+        error_response(
+            "invalid_request_error",
+            "Streaming is not supported by this proxy. Set stream: false.",
+            400
+        )
+
+    # Validate messages format
+    for i, msg in enumerate(messages):
+        if "role" not in msg:
+            error_response("invalid_request_error", f"messages[{i}]: role is required")
+        if msg["role"] not in ("user", "assistant"):
+            error_response("invalid_request_error", f"messages[{i}]: role must be 'user' or 'assistant'")
+        if "content" not in msg:
+            error_response("invalid_request_error", f"messages[{i}]: content is required")
+
+    # Call claude CLI
+    result = call_claude(
+        messages=messages,
+        model=model,
+        system=system,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=300,  # 5 min timeout for long responses
+    )
+
+    # Format response
+    response = format_anthropic_response(result, model)
+    respond(response)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""
+POST /v1/messages/batches — Create a message batch.
+Processes batch requests sequentially using the claude CLI.
+Stores results in a local file for later retrieval.
+"""
+import sys
+import os
+import json
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import (
+    read_request_body, respond, error_response,
+    generate_batch_id, call_claude, format_anthropic_response,
+)
+
+BATCH_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data", "batches")
+
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON body: {e}")
+
+    requests = body.get("requests")
+    if not requests:
+        error_response("invalid_request_error", "requests: field required")
+
+    batch_id = generate_batch_id()
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # Ensure batch storage dir exists
+    os.makedirs(BATCH_DIR, exist_ok=True)
+
+    # Store the batch metadata
+    batch_meta = {
+        "id": batch_id,
+        "type": "message_batch",
+        "processing_status": "in_progress",
+        "request_counts": {
+            "processing": len(requests),
+            "succeeded": 0,
+            "errored": 0,
+            "canceled": 0,
+            "expired": 0,
+        },
+        "created_at": created_at,
+        "ended_at": None,
+        "expires_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(time.time() + 86400)
+        ),
+        "results_url": None,
+        "requests": [r for r in requests],  # store for processing
+    }
+
+    with open(os.path.join(BATCH_DIR, f"{batch_id}.json"), "w") as f:
+        json.dump(batch_meta, f, indent=2)
+
+    # Return the batch metadata (without internal requests field)
+    output = {k: v for k, v in batch_meta.items() if k != "requests"}
+    respond(output)
+
+
+if __name__ == "__main__":
+    main()

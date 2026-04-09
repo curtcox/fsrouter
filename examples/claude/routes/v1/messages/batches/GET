@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""
+GET /v1/messages/batches — List all message batches.
+"""
+import sys
+import os
+import json
+import glob
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond
+
+BATCH_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data", "batches")
+
+
+def main():
+    limit = int(os.environ.get("QUERY_LIMIT", "20"))
+
+    batches = []
+    if os.path.isdir(BATCH_DIR):
+        for path in sorted(glob.glob(os.path.join(BATCH_DIR, "*.json")), reverse=True):
+            if path.endswith("-results.json"):
+                continue
+            try:
+                with open(path) as f:
+                    batch = json.load(f)
+                # Remove internal requests field
+                batch.pop("requests", None)
+                batches.append(batch)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    batches = batches[:limit]
+
+    respond({
+        "data": batches,
+        "has_more": False,
+        "first_id": batches[0]["id"] if batches else None,
+        "last_id": batches[-1]["id"] if batches else None,
+    })
+
+
+if __name__ == "__main__":
+    main()
