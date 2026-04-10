@@ -268,7 +268,12 @@ fi
 ROUTE_DIR="$SCRIPT_DIR/routes"
 if [ -d "$ROUTE_DIR/v1" ]; then
     HANDLER_COUNT=$(find "$ROUTE_DIR" -type f \( -name GET -o -name POST -o -name DELETE -o -name PUT -o -name PATCH \) | wc -l | tr -d ' ')
-    EXEC_COUNT=$(find "$ROUTE_DIR" -type f \( -name GET -o -name POST -o -name DELETE -o -name PUT -o -name PATCH \) -executable 2>/dev/null | wc -l | tr -d ' ')
+    # macOS find doesn't support -executable; use -perm +111 on macOS, -executable on Linux
+    if [[ "$(uname)" == "Darwin" ]]; then
+        EXEC_COUNT=$(find "$ROUTE_DIR" -type f \( -name GET -o -name POST -o -name DELETE -o -name PUT -o -name PATCH \) -perm +111 2>/dev/null | wc -l | tr -d ' ')
+    else
+        EXEC_COUNT=$(find "$ROUTE_DIR" -type f \( -name GET -o -name POST -o -name DELETE -o -name PUT -o -name PATCH \) -executable 2>/dev/null | wc -l | tr -d ' ')
+    fi
 
     if [ "$HANDLER_COUNT" -eq 0 ]; then
         fail "No route handlers found in $ROUTE_DIR"
