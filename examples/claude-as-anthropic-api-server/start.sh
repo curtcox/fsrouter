@@ -159,7 +159,7 @@ except:
     #    We always run this probe — even when auth status reports
     #    logged-in, the token could be expired or the API unreachable.
     if true; then
-        PROBE_RESULT=$(echo "respond with only: ok" | claude -p --output-format json --model sonnet --no-session-persistence --bare 2>&1 || true)
+        PROBE_RESULT=$(claude -p "respond with only: ok" --output-format json --model sonnet --no-session-persistence 2>&1 || true)
 
         PROBE_ERROR=$(echo "$PROBE_RESULT" | python3 -c "
 import sys, json
