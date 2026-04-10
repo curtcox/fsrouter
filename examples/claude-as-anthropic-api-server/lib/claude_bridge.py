@@ -143,7 +143,6 @@ def call_claude(
         "--output-format", "json",
         "--model", model_flag,
         "--no-session-persistence",
-        "--bare",
     ]
 
     try:
