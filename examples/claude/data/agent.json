@@ -1,0 +1,25 @@
+[
+  {
+    "id": "agent_249543912d454504aab1c7c7",
+    "type": "agent",
+    "created_at": "2026-04-10T00:23:02Z",
+    "updated_at": "2026-04-10T00:23:22Z",
+    "archived_at": "2026-04-10T00:23:22Z",
+    "name": "Updated Coding Assistant",
+    "description": "Now with description",
+    "model": {
+      "id": "claude-sonnet-4-6",
+      "speed": "standard"
+    },
+    "system": "You are helpful.",
+    "tools": [
+      {
+        "type": "agent_toolset_20260401"
+      }
+    ],
+    "mcp_servers": [],
+    "skills": [],
+    "metadata": {},
+    "version": 2
+  }
+]

@@ -1,0 +1,49 @@
+[
+  {
+    "id": "session_6213a7a5ddd049b7993790b0",
+    "type": "session",
+    "created_at": "2026-04-10T00:23:13Z",
+    "updated_at": "2026-04-10T00:23:13Z",
+    "archived_at": null,
+    "agent": {
+      "id": "agent_249543912d454504aab1c7c7",
+      "type": "agent",
+      "version": 2,
+      "name": "Updated Coding Assistant",
+      "description": "Now with description",
+      "model": {
+        "id": "claude-sonnet-4-6",
+        "speed": "standard"
+      },
+      "system": "You are helpful.",
+      "tools": [
+        {
+          "type": "agent_toolset_20260401"
+        }
+      ],
+      "mcp_servers": [],
+      "skills": []
+    },
+    "environment_id": "env_5922af644b3640dab0b6c7d4",
+    "title": "Test session",
+    "metadata": {},
+    "resources": [],
+    "vault_ids": [
+      "vault_bc6ba1e8840944b6be395161"
+    ],
+    "status": "idle",
+    "stats": {
+      "active_seconds": 0,
+      "duration_seconds": 0
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      }
+    }
+  }
+]

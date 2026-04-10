@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""POST /v1/sessions/:session_id — Update Session"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response
+import store
+
+def main():
+    session_id = os.environ.get("PARAM_SESSION_ID", "")
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON: {e}")
+
+    session = store.get("session", session_id)
+    if not session:
+        error_response("not_found_error", f"Session '{session_id}' not found", 400)
+
+    updates = {}
+    for field in ("title", "metadata"):
+        if field in body:
+            updates[field] = body[field]
+
+    session = store.update("session", session_id, updates)
+    respond(session)
+
+if __name__ == "__main__":
+    main()

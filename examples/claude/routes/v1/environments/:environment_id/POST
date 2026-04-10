@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""POST /v1/environments/:environment_id — Update Environment"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response
+import store
+
+def main():
+    env_id = os.environ.get("PARAM_ENVIRONMENT_ID", "")
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON: {e}")
+
+    env = store.get("environment", env_id)
+    if not env:
+        error_response("not_found_error", f"Environment '{env_id}' not found", 400)
+
+    updates = {}
+    for field in ("name", "description", "config", "metadata"):
+        if field in body:
+            updates[field] = body[field]
+
+    env = store.update("environment", env_id, updates)
+    respond(env)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+[
+  {
+    "id": "skill_bc26201be4a14e2baed34152",
+    "type": "skill",
+    "created_at": "2026-04-10T00:23:22Z",
+    "updated_at": "2026-04-10T00:23:22Z",
+    "archived_at": null,
+    "display_title": "Code Reviewer",
+    "source": "custom",
+    "latest_version": "1",
+    "content": "",
+    "description": "Reviews code for bugs"
+  }
+]

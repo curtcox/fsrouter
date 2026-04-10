@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""DELETE /v1/sessions/:session_id — Delete Session"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+def main():
+    session_id = os.environ.get("PARAM_SESSION_ID", "")
+    deleted = store.delete("session", session_id)
+    if not deleted:
+        error_response("not_found_error", f"Session '{session_id}' not found", 400)
+    respond({"id": session_id, "type": "session_deleted"})
+
+if __name__ == "__main__":
+    main()

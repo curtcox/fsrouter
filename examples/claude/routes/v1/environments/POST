@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""POST /v1/environments — Create Environment"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response
+import store
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON: {e}")
+
+    name = body.get("name")
+    if not name:
+        error_response("invalid_request_error", "name: field required")
+
+    config = body.get("config", {
+        "type": "cloud",
+        "networking": {"type": "unrestricted"},
+        "packages": {"pip": [], "npm": [], "apt": [], "cargo": [], "gem": [], "go": []},
+    })
+    if config.get("type") != "cloud":
+        config["type"] = "cloud"
+    if "networking" not in config:
+        config["networking"] = {"type": "unrestricted"}
+    if "packages" not in config:
+        config["packages"] = {"pip": [], "npm": [], "apt": [], "cargo": [], "gem": [], "go": []}
+    else:
+        for key in ("pip", "npm", "apt", "cargo", "gem", "go"):
+            if key not in config["packages"]:
+                config["packages"][key] = []
+
+    env = store.create("environment", "env", {
+        "name": name,
+        "description": body.get("description", ""),
+        "config": config,
+        "metadata": body.get("metadata", {}),
+    })
+    respond(env)
+
+if __name__ == "__main__":
+    main()

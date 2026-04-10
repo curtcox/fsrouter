@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""
+GET /v1/sessions/:session_id/events — List events for a session.
+Returns stored events (in this implementation, a stub that returns an empty list
+since full event history is not persisted).
+"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+def main():
+    session_id = os.environ.get("PARAM_SESSION_ID", "")
+    session = store.get("session", session_id)
+    if not session:
+        error_response("not_found_error", f"Session '{session_id}' not found", 400)
+
+    # Event history not persisted in this implementation
+    respond({"data": [], "has_more": False, "first_id": None, "last_id": None})
+
+if __name__ == "__main__":
+    main()

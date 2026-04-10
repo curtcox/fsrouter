@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""GET /v1/environments — List Environments"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import respond
+import store
+
+def main():
+    limit = int(os.environ.get("QUERY_LIMIT", "20"))
+    after_id = os.environ.get("QUERY_AFTER_ID", "") or None
+    before_id = os.environ.get("QUERY_BEFORE_ID", "") or None
+    respond(store.list_all("environment", limit, after_id, before_id))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""
+POST /v1/files — Upload File.
+In this implementation, files are stored as metadata only.
+The actual file content from multipart uploads is read from stdin
+but stored on the local filesystem under data/files/.
+"""
+import sys, os, json, time, uuid, hashlib
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+FILES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "data", "files")
+
+def main():
+    os.makedirs(FILES_DIR, exist_ok=True)
+
+    # Read raw body from stdin (may be multipart)
+    body = sys.stdin.buffer.read()
+    content_type = os.environ.get("CONTENT_TYPE", "")
+
+    # Try to extract filename from multipart or use a default
+    filename = "uploaded_file"
+    mime_type = "application/octet-stream"
+
+    if b"filename=" in body:
+        try:
+            idx = body.index(b"filename=")
+            rest = body[idx + 9:]
+            if rest[0:1] == b'"':
+                end = rest.index(b'"', 1)
+                filename = rest[1:end].decode("utf-8", errors="replace")
+            else:
+                end = rest.index(b"\r")
+                filename = rest[:end].decode("utf-8", errors="replace")
+        except (ValueError, IndexError):
+            pass
+
+    # Guess mime type from filename
+    import mimetypes
+    guessed = mimetypes.guess_type(filename)[0]
+    if guessed:
+        mime_type = guessed
+
+    file_id = "file_" + uuid.uuid4().hex[:24]
+
+    # Save file content
+    file_path = os.path.join(FILES_DIR, file_id)
+    with open(file_path, "wb") as f:
+        f.write(body)
+
+    file_meta = store.create("file", "file", {
+        "id": file_id,  # override generated id
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": len(body),
+        "downloadable": True,
+        "scope": None,
+    })
+    # Fix the id to our custom one
+    store.update("file", file_meta["id"], {"id": file_id}) if file_meta["id"] != file_id else None
+
+    respond({
+        "id": file_id,
+        "type": "file",
+        "created_at": file_meta["created_at"],
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": len(body),
+        "downloadable": True,
+        "scope": None,
+    })
+
+if __name__ == "__main__":
+    main()

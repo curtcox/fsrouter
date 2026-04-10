@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""GET /v1/vaults/:vault_id — Retrieve Vault"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+def main():
+    vault_id = os.environ.get("PARAM_VAULT_ID", "")
+    vault = store.get("vault", vault_id)
+    if not vault:
+        error_response("not_found_error", f"Vault '{vault_id}' not found", 400)
+    respond(vault)
+
+if __name__ == "__main__":
+    main()

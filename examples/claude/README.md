@@ -1,53 +1,32 @@
 # Anthropic-Compatible API Server
 
-A local API server that exposes endpoints compatible with the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages), powered by [fsrouter](https://github.com/curtcox/fsrouter) and the `claude` CLI. **No API key required.**
+A local API server that exposes endpoints compatible with the [Anthropic API](https://platform.claude.com/docs/en/api/overview), powered by [fsrouter](https://github.com/curtcox/fsrouter) and the `claude` CLI. **No API key required.**
+
+Implements **38 endpoints** covering the full Anthropic API surface: Messages, Models, Batches, Agents, Sessions, Environments, Vaults, Files, and Skills.
 
 ## How It Works
 
-This server uses fsrouter's filesystem-based routing to map the directory tree under `routes/` directly to HTTP endpoints. Each handler is a Python script that translates Anthropic API requests into `claude` CLI calls and formats the responses to match the official API shape.
-
-```
-routes/
-  v1/
-    messages/
-      POST                          → POST /v1/messages
-      count_tokens/
-        POST                        → POST /v1/messages/count_tokens
-      batches/
-        GET                         → GET  /v1/messages/batches
-        POST                        → POST /v1/messages/batches
-        :batch_id/
-          GET                       → GET  /v1/messages/batches/:id
-          cancel/POST               → POST /v1/messages/batches/:id/cancel
-          results/GET               → GET  /v1/messages/batches/:id/results
-    models/
-      GET                           → GET  /v1/models
-      :model_id/
-        GET                         → GET  /v1/models/:id
-```
+fsrouter maps the directory tree under `routes/` directly to HTTP endpoints. Each handler is a Python script that translates API requests into `claude` CLI calls (for message generation) or local JSON-file storage (for resource CRUD) and formats responses to match the official API shape.
 
 ## Prerequisites
 
 - Python 3.8+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` command available)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - [fsrouter](https://github.com/curtcox/fsrouter) (clone it next to this project)
 
 ## Quick Start
 
 ```bash
-# Clone fsrouter alongside this project
 git clone https://github.com/curtcox/fsrouter.git
-
-# Start the server
 cd anthropic-api-server
 ./start.sh
 ```
 
 The server starts on port 8082 by default. Customize with `PORT=9000 ./start.sh`.
 
-## Usage
+## Usage Examples
 
-### Send a message (like the real API, minus the auth header)
+### Messages
 
 ```bash
 curl http://localhost:8082/v1/messages \
@@ -55,73 +34,175 @@ curl http://localhost:8082/v1/messages \
   -d '{
     "model": "claude-sonnet-4-6",
     "max_tokens": 1024,
-    "messages": [
-      {"role": "user", "content": "What is the capital of France?"}
-    ]
+    "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
 
-### Response format (matches Anthropic API)
-
-```json
-{
-  "id": "msg_abc123...",
-  "type": "message",
-  "role": "assistant",
-  "content": [
-    {"type": "text", "text": "The capital of France is Paris."}
-  ],
-  "model": "claude-sonnet-4-6",
-  "stop_reason": "end_turn",
-  "stop_sequence": null,
-  "usage": {
-    "input_tokens": 15,
-    "output_tokens": 8,
-    "cache_creation_input_tokens": 0,
-    "cache_read_input_tokens": 0
-  }
-}
-```
-
-### List models
+### Create an Agent + Environment + Session (Managed Agents flow)
 
 ```bash
-curl http://localhost:8082/v1/models
-```
-
-### Count tokens
-
-```bash
-curl http://localhost:8082/v1/messages/count_tokens \
+# 1. Create an agent
+AGENT_ID=$(curl -s http://localhost:8082/v1/agents \
   -H "Content-Type: application/json" \
   -d '{
+    "name": "Coding Assistant",
     "model": "claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "Hello, world!"}]
+    "system": "You are a helpful coding assistant.",
+    "tools": [{"type": "agent_toolset_20260401"}]
+  }' | jq -r '.id')
+
+# 2. Create an environment
+ENV_ID=$(curl -s http://localhost:8082/v1/environments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "python-env",
+    "config": {
+      "type": "cloud",
+      "networking": {"type": "unrestricted"},
+      "packages": {"pip": ["pandas", "numpy"]}
+    }
+  }' | jq -r '.id')
+
+# 3. Create a session
+SESSION_ID=$(curl -s http://localhost:8082/v1/sessions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"agent\": \"$AGENT_ID\",
+    \"environment_id\": \"$ENV_ID\",
+    \"title\": \"My coding session\"
+  }" | jq -r '.id')
+
+# 4. Send events to the session
+curl -s "http://localhost:8082/v1/sessions/$SESSION_ID/events" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [{
+      "type": "user.message",
+      "content": [{"type": "text", "text": "Write a fibonacci function in Python"}]
+    }]
   }'
 ```
 
-## Supported Endpoints
+## All Endpoints (38 total)
+
+### Messages (GA)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/v1/messages` | Create a message |
 | POST | `/v1/messages/count_tokens` | Count input tokens |
+
+### Models (GA)
+
+| Method | Path | Description |
+|--------|------|-------------|
 | GET | `/v1/models` | List available models |
 | GET | `/v1/models/:model_id` | Get model details |
+
+### Message Batches (GA)
+
+| Method | Path | Description |
+|--------|------|-------------|
 | POST | `/v1/messages/batches` | Create a batch |
 | GET | `/v1/messages/batches` | List batches |
 | GET | `/v1/messages/batches/:batch_id` | Get batch status |
 | POST | `/v1/messages/batches/:batch_id/cancel` | Cancel a batch |
 | GET | `/v1/messages/batches/:batch_id/results` | Get batch results |
 
+### Agents (Beta: `managed-agents-2026-04-01`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/agents` | Create agent |
+| GET | `/v1/agents` | List agents |
+| GET | `/v1/agents/:agent_id` | Retrieve agent |
+| POST | `/v1/agents/:agent_id` | Update agent |
+| POST | `/v1/agents/:agent_id/archive` | Archive agent |
+
+### Sessions (Beta: `managed-agents-2026-04-01`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/sessions` | Create session |
+| GET | `/v1/sessions` | List sessions |
+| GET | `/v1/sessions/:session_id` | Retrieve session |
+| POST | `/v1/sessions/:session_id` | Update session |
+| DELETE | `/v1/sessions/:session_id` | Delete session |
+| POST | `/v1/sessions/:session_id/archive` | Archive session |
+| POST | `/v1/sessions/:session_id/events` | Send events |
+| GET | `/v1/sessions/:session_id/events` | List events |
+
+### Environments (Beta: `managed-agents-2026-04-01`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/environments` | Create environment |
+| GET | `/v1/environments` | List environments |
+| GET | `/v1/environments/:environment_id` | Retrieve environment |
+| POST | `/v1/environments/:environment_id` | Update environment |
+| DELETE | `/v1/environments/:environment_id` | Delete environment |
+
+### Vaults (Beta: `managed-agents-2026-04-01`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/vaults` | Create vault |
+| GET | `/v1/vaults` | List vaults |
+| GET | `/v1/vaults/:vault_id` | Retrieve vault |
+| POST | `/v1/vaults/:vault_id` | Update vault |
+| DELETE | `/v1/vaults/:vault_id` | Delete vault |
+
+### Files (Beta: `files-api-2025-04-14`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/files` | Upload file |
+| GET | `/v1/files` | List files |
+| GET | `/v1/files/:file_id` | Retrieve file metadata |
+| DELETE | `/v1/files/:file_id` | Delete file |
+
+### Skills (Beta: `skills-2025-10-02`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/skills` | Create skill |
+| GET | `/v1/skills` | List skills |
+
 ## Differences from the Official API
 
-- **No authentication** — the `x-api-key` header is accepted but ignored
-- **No streaming** — `stream: true` returns an error; use `stream: false`
-- **Token counts are estimates** — the count_tokens endpoint uses a rough heuristic
+- **No authentication** — `x-api-key` and `anthropic-beta` headers are accepted but ignored
+- **No streaming/SSE** — `stream: true` returns an error; session event streaming returns JSON instead of SSE
+- **Token counts are estimates** — count_tokens uses a heuristic (~4 chars/token)
 - **Batch processing is synchronous** — batches are processed when results are requested
-- **No vision/document support** — image and PDF content blocks are not forwarded to the CLI
-- **Usage metrics are approximate** — based on character-to-token ratio estimates
+- **No real containers** — environments are stored as configuration only; no actual container provisioning
+- **No real credential storage** — vaults store metadata only, no actual secret management
+- **Session events use claude CLI** — events are processed synchronously rather than via a long-running agent loop
+- **Usage metrics are approximate** — based on claude CLI output when available
+
+## Architecture
+
+```
+routes/                      ← fsrouter maps this to URLs
+  v1/
+    messages/POST            ← calls claude CLI, returns Anthropic response format
+    agents/POST              ← CRUD backed by lib/store.py (JSON files)
+    sessions/.../events/POST ← calls claude CLI within session context
+    ...
+
+lib/
+  claude_bridge.py           ← claude CLI invocation + response formatting
+  store.py                   ← JSON-file-backed CRUD for all resources
+
+data/                        ← created at runtime
+  agent.json                 ← stored agents
+  session.json               ← stored sessions
+  environment.json           ← stored environments
+  vault.json                 ← stored vaults
+  file.json                  ← file metadata
+  skill.json                 ← stored skills
+  batches/                   ← batch data
+  files/                     ← uploaded file content
+```
 
 ## Configuration
 
@@ -129,17 +210,6 @@ curl http://localhost:8082/v1/messages/count_tokens \
 |---------------------|---------|-------------|
 | `PORT` | `8082` | Server listen port |
 | `COMMAND_TIMEOUT` | `300` | Max seconds per handler execution |
-
-## Architecture
-
-Each route handler is an independent Python script executed as a subprocess by fsrouter. The handler:
-
-1. Reads the JSON request body from stdin
-2. Validates the request against the Anthropic API schema
-3. Converts messages to a prompt string for the `claude` CLI
-4. Invokes `claude -p --output-format json --model <model>`
-5. Transforms the CLI output into the Anthropic API response format
-6. Writes JSON to stdout (fsrouter sends it as the HTTP response)
 
 ## License
 

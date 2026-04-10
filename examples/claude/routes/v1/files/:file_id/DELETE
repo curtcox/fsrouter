@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""DELETE /v1/files/:file_id — Delete File"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+FILES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))), "data", "files")
+
+def main():
+    file_id = os.environ.get("PARAM_FILE_ID", "")
+    deleted = store.delete("file", file_id)
+    if not deleted:
+        error_response("not_found_error", f"File '{file_id}' not found", 400)
+
+    # Also remove the actual file content
+    file_path = os.path.join(FILES_DIR, file_id)
+    if os.path.isfile(file_path):
+        os.remove(file_path)
+
+    respond({"id": file_id, "type": "file_deleted"})
+
+if __name__ == "__main__":
+    main()

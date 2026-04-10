@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""POST /v1/sessions — Create Session"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response
+import store
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON: {e}")
+
+    agent_ref = body.get("agent")
+    if not agent_ref:
+        error_response("invalid_request_error", "agent: field required")
+
+    environment_id = body.get("environment_id")
+    if not environment_id:
+        error_response("invalid_request_error", "environment_id: field required")
+
+    # Resolve agent reference
+    if isinstance(agent_ref, str):
+        agent_id = agent_ref
+        agent = store.get("agent", agent_id)
+    elif isinstance(agent_ref, dict):
+        agent_id = agent_ref.get("id", "")
+        agent = store.get("agent", agent_id)
+    else:
+        error_response("invalid_request_error", "agent: must be string or object")
+
+    # Build agent snapshot for session
+    agent_snapshot = {
+        "id": agent_id,
+        "type": "agent",
+        "version": agent.get("version", 1) if agent else 1,
+        "name": agent.get("name", "Unknown") if agent else "Unknown",
+        "description": agent.get("description", "") if agent else "",
+        "model": agent.get("model", {"id": "claude-sonnet-4-6"}) if agent else {"id": "claude-sonnet-4-6"},
+        "system": agent.get("system", "") if agent else "",
+        "tools": agent.get("tools", []) if agent else [],
+        "mcp_servers": agent.get("mcp_servers", []) if agent else [],
+        "skills": agent.get("skills", []) if agent else [],
+    }
+
+    session = store.create("session", "session", {
+        "agent": agent_snapshot,
+        "environment_id": environment_id,
+        "title": body.get("title", ""),
+        "metadata": body.get("metadata", {}),
+        "resources": body.get("resources", []),
+        "vault_ids": body.get("vault_ids", []),
+        "status": "idle",
+        "stats": {"active_seconds": 0, "duration_seconds": 0},
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0},
+        },
+    })
+    respond(session)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""POST /v1/vaults — Create Vault"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response
+import store
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON: {e}")
+
+    display_name = body.get("display_name")
+    if not display_name:
+        error_response("invalid_request_error", "display_name: field required")
+
+    vault = store.create("vault", "vault", {
+        "display_name": display_name,
+        "metadata": body.get("metadata", {}),
+    })
+    respond(vault)
+
+if __name__ == "__main__":
+    main()

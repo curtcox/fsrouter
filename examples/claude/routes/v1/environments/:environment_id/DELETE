@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""DELETE /v1/environments/:environment_id — Delete Environment"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+def main():
+    env_id = os.environ.get("PARAM_ENVIRONMENT_ID", "")
+    deleted = store.delete("environment", env_id)
+    if not deleted:
+        error_response("not_found_error", f"Environment '{env_id}' not found", 400)
+    respond({"id": env_id, "type": "environment_deleted"})
+
+if __name__ == "__main__":
+    main()

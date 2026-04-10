@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""POST /v1/agents — Create Agent"""
+import sys, os, json
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib"))
+from claude_bridge import read_request_body, respond, error_response
+import store
+
+def main():
+    try:
+        body = read_request_body()
+    except Exception as e:
+        error_response("invalid_request_error", f"Invalid JSON: {e}")
+
+    name = body.get("name")
+    if not name:
+        error_response("invalid_request_error", "name: field required")
+
+    model = body.get("model", "claude-sonnet-4-6")
+    # Normalize model to config object
+    if isinstance(model, str):
+        model = {"id": model, "speed": "standard"}
+
+    agent = store.create("agent", "agent", {
+        "name": name,
+        "description": body.get("description", ""),
+        "model": model,
+        "system": body.get("system", ""),
+        "tools": body.get("tools", []),
+        "mcp_servers": body.get("mcp_servers", []),
+        "skills": body.get("skills", []),
+        "metadata": body.get("metadata", {}),
+        "version": 1,
+    })
+    respond(agent)
+
+if __name__ == "__main__":
+    main()

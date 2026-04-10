@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""GET /v1/environments/:environment_id — Retrieve Environment"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lib"))
+from claude_bridge import respond, error_response
+import store
+
+def main():
+    env_id = os.environ.get("PARAM_ENVIRONMENT_ID", "")
+    env = store.get("environment", env_id)
+    if not env:
+        error_response("not_found_error", f"Environment '{env_id}' not found", 400)
+    respond(env)
+
+if __name__ == "__main__":
+    main()
