@@ -12,6 +12,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-8082}"
 PROBLEMS=0
+FATAL=0
 
 # ── Color helpers (degrade gracefully if no tty) ─────────────
 if [ -t 1 ]; then
@@ -26,7 +27,7 @@ fi
 
 ok()   { echo -e "  ${GREEN}[OK]${RESET}    $1"; }
 warn() { echo -e "  ${YELLOW}[WARN]${RESET}  $1"; PROBLEMS=$((PROBLEMS + 1)); }
-fail() { echo -e "  ${RED}[FAIL]${RESET}  $1"; PROBLEMS=$((PROBLEMS + 1)); }
+fail() { echo -e "  ${RED}[FAIL]${RESET}  $1"; PROBLEMS=$((PROBLEMS + 1)); FATAL=$((FATAL + 1)); }
 
 # ══════════════════════════════════════════════════════════════
 #  Preflight Checks
@@ -273,6 +274,12 @@ if [ -d "$ROUTE_DIR/v1" ]; then
         fail "No route handlers found in $ROUTE_DIR"
         echo "       The routes/ directory should contain handler files named GET, POST, etc."
         echo ""
+    elif [ "$EXEC_COUNT" -eq 0 ]; then
+        fail "All $HANDLER_COUNT handlers are not executable — no endpoints will work"
+        echo ""
+        echo "       Resolution:"
+        echo "         chmod +x \$(find routes -type f \\( -name GET -o -name POST -o -name DELETE \\))"
+        echo ""
     elif [ "$EXEC_COUNT" -lt "$HANDLER_COUNT" ]; then
         NOT_EXEC=$((HANDLER_COUNT - EXEC_COUNT))
         warn "$NOT_EXEC of $HANDLER_COUNT handlers are not executable"
@@ -292,26 +299,15 @@ fi
 echo "────────────────────────────────────────────"
 if [ "$PROBLEMS" -eq 0 ]; then
     echo -e "  ${GREEN}All checks passed.${RESET}"
-else
-    echo -e "  ${YELLOW}${PROBLEMS} problem(s) detected.${RESET}"
-
-    # Decide whether to abort or continue with degraded functionality
-    FATAL=0
-    [ -z "$FSROUTER" ] && FATAL=1
-    ! command -v python3 &>/dev/null && FATAL=1
-
-    if [ "$FATAL" -gt 0 ]; then
-        echo ""
-        echo -e "  ${RED}Cannot start — missing required dependencies (see above).${RESET}"
-        echo ""
-        exit 1
-    fi
-
     echo ""
-    echo "  Starting anyway — some endpoints may return errors."
-    echo "  Endpoints that don't call Claude (models, agents CRUD, etc.) will work."
+elif [ "$FATAL" -gt 0 ]; then
+    echo -e "  ${RED}${FATAL} error(s) found. Fix them before starting the server.${RESET}"
+    echo ""
+    exit 1
+else
+    echo -e "  ${YELLOW}${PROBLEMS} warning(s) — starting with degraded functionality.${RESET}"
+    echo ""
 fi
-echo ""
 
 # ══════════════════════════════════════════════════════════════
 #  Ensure data directories exist
