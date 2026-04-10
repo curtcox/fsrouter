@@ -18,7 +18,7 @@ fsrouter maps the directory tree under `routes/` directly to HTTP endpoints. Eac
 
 ```bash
 git clone https://github.com/curtcox/fsrouter.git
-cd anthropic-api-server
+cd claude-as-anthropic-api-server
 ./start.sh
 ```
 
